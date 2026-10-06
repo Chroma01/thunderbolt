@@ -285,7 +285,7 @@ export const createPowerSyncRoutes = (auth: Auth, settings: Settings, database: 
         // with its own UI still reporting itself synced. That failure mode is
         // what `MIN_APP_VERSION` exists to pre-empt, and why the gate has to be
         // live before any v2 client can reach a user — see the cutover runbook
-        // in docs/architecture/e2e-encryption.md.
+        // in docs/internals/architecture/e2e-encryption.md.
         const encryptionMetadata = await getEncryptionMetadata(database, user.id)
         if (encryptionMetadata?.schemeVersion === 2) {
           const violation = findPlaintextViolation(operations)

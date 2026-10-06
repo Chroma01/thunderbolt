@@ -81,7 +81,7 @@ export const handleCredentialsInvalidIfNeeded = (status: number, body: ErrorBody
  * so a PUT is a row the device invented while a PATCH is a deliberate edit.
  *
  * Full rationale, the safety properties, and the known gaps:
- * docs/architecture/powersync-account-devices.md — "Create-only writes".
+ * docs/internals/architecture/powersync-account-devices.md — "Create-only writes".
  */
 export const isCreateOnlyWrite = (op: 'PUT' | 'PATCH' | 'DELETE', hasSynced: boolean): boolean =>
   op === 'PUT' && !hasSynced

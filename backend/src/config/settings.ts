@@ -158,7 +158,7 @@ const settingsSchema = z
     // Both set = the share feature is enabled for this deployment's users.
     debugTranscriptUpstreamUrl: z.string().trim().default(''),
     debugTranscriptUpstreamKey: z.string().trim().default(''),
-    // Rollout order: docs/self-hosting/configuration.md#cli-device-rollout.
+    // Rollout order: docs/self-hosting/configuration.md#command-line-client-rollout.
     // Kill switch for the server-owned CLI device row.
     cliDeviceRegistrationEnabled: z.boolean().default(false),
 

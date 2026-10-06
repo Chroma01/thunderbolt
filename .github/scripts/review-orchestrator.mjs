@@ -107,7 +107,7 @@ const DEEP_MODE_FILE_COUNT = 40; // tunable for the team's PR sizes.
 // the deep-mode gate: code decides when the security lane spends, never the
 // model. Matched against the PR's changed-file paths (repo-relative, exactly as
 // the Files API returns them in `filename`). Keep in sync with the security-review
-// surface list in docs/architecture/e2ee-threat-model.md (the "Consumers" table).
+// surface list in docs/internals/architecture/e2ee-threat-model.md (the "Consumers" table).
 const SECURITY_PATH_MATCHERS = [
   (p) => p.startsWith('src/crypto/'),
   (p) => p.startsWith('src/db/encryption/'),

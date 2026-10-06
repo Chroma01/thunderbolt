@@ -13,7 +13,7 @@
  *
  * Two callers, one implementation: a frozen attack spec calls these from CI, and
  * an agent hunting live (see the `thunder-red-team` skill) calls them in a loop
- * to check itself. Claims are the C-ids in docs/architecture/e2ee-threat-model.md.
+ * to check itself. Claims are the C-ids in docs/internals/architecture/e2ee-threat-model.md.
  *
  * These assume E2EE is ON for the account under test. With `E2EE_ENABLED=false`
  * every column is legitimately plaintext and `expectAllColumnsCiphertext` fails

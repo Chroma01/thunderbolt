@@ -7,7 +7,7 @@
  * itself, and the floor every attack spec in this directory builds on.
  *
  * Claim under test: C1 (zero-knowledge server) in
- * docs/architecture/e2ee-threat-model.md.
+ * docs/internals/architecture/e2ee-threat-model.md.
  *
  * Requires the PowerSync + Postgres harness. Run with:
  *   bash scripts/run-e2ee-powersync.sh attacks/confidentiality.spec.ts

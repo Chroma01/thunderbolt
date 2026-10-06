@@ -12,8 +12,8 @@
  * document was a working artifact and is NOT in this repo — do not go looking
  * for `docs/architecture/e2ee-v2-plan.md`. Treat the markers as provenance, not
  * as references you can follow. The living documentation is
- * `docs/architecture/e2e-encryption.md` (as-built) and
- * `docs/architecture/e2ee-threat-model.md` (claims and adversaries); anything a
+ * `docs/internals/architecture/e2e-encryption.md` (as-built) and
+ * `docs/internals/architecture/e2ee-threat-model.md` (claims and adversaries); anything a
  * marker was carrying that still matters should be inlined here as it is
  * touched.
  *
@@ -201,7 +201,7 @@ export const encryptedColumnsMap: Readonly<Record<string, readonly string[]>> = 
   // refuse them on every newly-enrolled device. RULE: adding a column or table
   // to this map while plaintext rows for it already exist server-side requires
   // the same kind of migration in the same change — see C1 in
-  // docs/architecture/e2ee-threat-model.md. NOTE `name` and `url` are the first
+  // docs/internals/architecture/e2ee-threat-model.md. NOTE `name` and `url` are the first
   // mapped columns that are NOT NULL in Postgres
   // (`backend/src/db/powersync-schema.ts`), which is why the quarantine
   // suppresses whole sync ops (op → MOVE) rather than nulling columns — a
@@ -264,7 +264,7 @@ const utf8 = new TextEncoder()
  * sync-decode path MUST build AAD through this helper — never inline.
  *
  * DELIBERATELY NO ACCOUNT COMPONENT, and adding one was considered and rejected
- * (THU-891, cancelled — see claim C3 in `docs/architecture/e2ee-threat-model.md`).
+ * (THU-891, cancelled — see claim C3 in `docs/internals/architecture/e2ee-threat-model.md`).
  * An AAD component only buys separation between two contexts that resolve the
  * SAME key material, and two accounts never do: `decrypt` fails on the auth tag
  * long before the AAD is consulted. Note this is load-bearing for the reconciled

@@ -78,6 +78,6 @@ TESTING AND TOOLING
 SEVERITY CALIBRATION
 Derive severity from preconditions and adversary class, not from category. A
 weakness reachable only by an adversary who already holds the AK is not
-Critical. Anchor to the scale in docs/architecture/e2ee-threat-model.md and be
+Critical. Anchor to the scale in docs/internals/architecture/e2ee-threat-model.md and be
 skeptical of inflation: if the attack needs three preconditions, say so and
 downgrade accordingly.

@@ -63,7 +63,7 @@ type PowerSyncOperation = {
    * resetting a setting to its default.
    *
    * Full rationale, the safety properties, and the known gaps:
-   * docs/architecture/powersync-account-devices.md — "Create-only writes".
+   * docs/internals/architecture/powersync-account-devices.md — "Create-only writes".
    */
   ifAbsent?: boolean
 }

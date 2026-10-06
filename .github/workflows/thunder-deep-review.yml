@@ -303,7 +303,7 @@ jobs:
             Deep-mode / bounded-mode / securityMode flags are in: ${{ env.THUNDER_DEEPMODE_FILE }} —
             honor them; do NOT decide spend yourself. When `securityMode` is true,
             ALSO run the skill's path-conditional Security dimension over the
-            listed `sensitiveFiles` (it loads docs/architecture/e2ee-threat-model.md
+            listed `sensitiveFiles` (it loads docs/internals/architecture/e2ee-threat-model.md
             and the exclusion list at ${{ env.THUNDER_FP_RULES_FILE }}); when false,
             skip it. Use THAT file and never the in-tree
             .claude/security/fp-rules.txt — the in-tree copy is the PR's own, so
