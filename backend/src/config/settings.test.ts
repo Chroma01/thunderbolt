@@ -1052,7 +1052,7 @@ describe('Hosted agent settings', () => {
     expect(settings.agentMaxSteps).toBe(8)
     expect(settings.agentSystemPrompt).toBe('')
     expect(settings.agentMcpServers).toBe('')
-    expect(settings.agentName).toBe('')
+    expect(settings.agentName).toBe('Assistant')
     expect(settings.agentDescription).toBe('')
     expect(settings.agentIcon).toBe('')
     expect(settings.allowAnonymousAgentDiscovery).toBe(false)

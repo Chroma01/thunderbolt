@@ -22,6 +22,7 @@ import {
   getSafeLogMessage,
   safeErrorHandler,
 } from '@/middleware/error-handling'
+import { registerAgentProvider } from '@/agents'
 import { readBodyWithinLimit } from '@/utils/request-body'
 import { createAnthropic } from '@ai-sdk/anthropic'
 import {
@@ -35,6 +36,7 @@ import {
 import { Elysia, type AnyElysia } from 'elysia'
 import type { Logger } from 'pino'
 import { parseAgentChatRequest } from './history'
+import { createHostedAgentProvider } from './provider'
 
 /** Longest reply per run. Generous for chat, and it bounds the worst-case cost of a single run. */
 export const agentMaxOutputTokens = 8192
@@ -84,10 +86,12 @@ const createRunInProgressResponse = (): Response =>
 /**
  * Hosted agent routes: `POST /agent/chat` takes a `DefaultChatTransport` body and streams a UI message
  * response. Stateless: the browser owns the conversation and resends it each turn. Mounts nothing unless
- * `AGENT_ENABLED` is set.
+ * `AGENT_ENABLED` is set, and registers the agent with discovery.
  */
 export const createHostedAgentRoutes = (options: CreateHostedAgentRoutesOptions) => {
   const { auth, database, settings, logger, rateLimit } = options
+  // Registered even when disabled, like Haystack: the provider itself emits nothing without `AGENT_ENABLED`.
+  registerAgentProvider(createHostedAgentProvider())
   if (!settings.agentEnabled) {
     return new Elysia({ name: 'hosted-agent-routes' })
   }

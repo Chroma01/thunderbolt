@@ -16,6 +16,7 @@ import { createTestDb } from '@/test-utils/db'
 import { cliRegistrationPendingDeviceId } from '@/dal/sessions'
 import { createMockAuth, mockAuth, mockAuthUnauthenticated } from '@/test-utils/mock-auth'
 import { createTestSettings } from '@/test-utils/settings'
+import { getRegisteredProviders, resetAgentProvidersForTesting } from '@/agents/discovery'
 import { APICallError, simulateReadableStream } from 'ai'
 import { MockLanguageModelV3 } from 'ai/test'
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test'
@@ -124,6 +125,13 @@ describe('createHostedAgentRoutes', () => {
   it('mounts no route when AGENT_ENABLED is off', async () => {
     const app = createMockedApp({ settings: { agentEnabled: false } })
     expect((await postChat(app)).status).toBe(404)
+  })
+
+  it.each([true, false])('registers its discovery provider when AGENT_ENABLED is %p', (agentEnabled) => {
+    resetAgentProvidersForTesting()
+    createMockedApp({ settings: { agentEnabled } })
+    expect(getRegisteredProviders().map(({ id }) => id)).toEqual(['hosted-agent'])
+    resetAgentProvidersForTesting()
   })
 
   it('refuses to start enabled without AGENT_MODEL', () => {

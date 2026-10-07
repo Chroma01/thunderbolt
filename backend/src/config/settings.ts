@@ -228,8 +228,8 @@ const settingsSchema = z
     // `id` is the public slug; `pipelineName` is the Deepset URL slug; `pipelineId` is the Deepset UUID.
     haystackPipelines: z.string().default(''),
 
-    // Hosted agent settings (see `@/hosted-agent/routes`). The max-steps, MCP and discovery settings below
-    // are inert until later PRs read them.
+    // Hosted agent settings (see `@/hosted-agent/routes`). Name, description, icon and anonymous discovery
+    // feed `GET /agents` (see `@/hosted-agent/provider`). The max-steps and MCP settings have no effect yet.
     agentEnabled: z.boolean().default(false),
     agentModel: z.string().default(''),
     // No effect until MCP tools land (GTM-28): without tools every run is a single step.
@@ -237,9 +237,10 @@ const settingsSchema = z
     agentSystemPrompt: z.string().default(''),
     // JSON array of MCP server descriptors the hosted agent may call.
     agentMcpServers: z.string().default(''),
-    agentName: z.string().default(''),
+    agentName: z.string().default('Assistant'),
     agentDescription: z.string().default(''),
     agentIcon: z.string().default(''),
+    // When true, anonymous sessions may call `GET /agents` and see only anonymous-safe agents.
     allowAnonymousAgentDiscovery: z.boolean().default(false),
   })
   .superRefine((data, ctx) => {
@@ -511,7 +512,7 @@ const parseSettings = (): Settings => {
     agentMaxSteps: process.env.AGENT_MAX_STEPS || undefined,
     agentSystemPrompt: process.env.AGENT_SYSTEM_PROMPT || '',
     agentMcpServers: process.env.AGENT_MCP_SERVERS || '',
-    agentName: process.env.AGENT_NAME || '',
+    agentName: process.env.AGENT_NAME || undefined,
     agentDescription: process.env.AGENT_DESCRIPTION || '',
     agentIcon: process.env.AGENT_ICON || '',
     allowAnonymousAgentDiscovery: process.env.ALLOW_ANONYMOUS_AGENT_DISCOVERY === 'true',
@@ -602,6 +603,12 @@ export const getEnabledAgentsList = (settings: Pick<Settings, 'enabledAgents'>):
     .split(',')
     .map((id) => id.trim())
     .filter((id) => id.length > 0)
+}
+
+/** Whether `ENABLED_AGENTS` lets `id` through. An empty list means no filter. */
+export const isAgentAllowed = (settings: Pick<Settings, 'enabledAgents'>, id: string): boolean => {
+  const enabledIds = getEnabledAgentsList(settings)
+  return enabledIds.length === 0 || enabledIds.includes(id)
 }
 
 /** Parse comma-separated auto-approved domains into a list */
