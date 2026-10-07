@@ -38,6 +38,7 @@ import { createWaitlistRoutes } from '@/waitlist/routes'
 import { createAccountRoutes } from '@/api/account'
 import { createAgentsRoutes } from '@/agents'
 import { createHaystackRoutes } from '@/haystack'
+import { createHostedAgentRoutes } from '@/hosted-agent/routes'
 import { createConfigRoutes } from '@/api/config'
 import { createEncryptionRoutes } from '@/api/encryption'
 import { createMiniAppRoutes } from '@/api/mini-apps'
@@ -90,6 +91,7 @@ export const createApp = async (deps?: AppDeps) => {
   const rateLimitSettings = { enabled: settings.rateLimitEnabled }
   const ipRateLimitSettings = { ...rateLimitSettings, trustedProxy: settings.trustedProxy }
   const proRateLimit = createUserTierRateLimit(database, rateLimitSettings, 'pro')
+  const inferenceRateLimit = createUserTierRateLimit(database, rateLimitSettings, 'inference')
 
   // Create auth plugin with the database instance (tests may inject their own auth)
   const { plugin: betterAuthPlugin, auth: createdAuth } = createBetterAuthPlugin(
@@ -176,7 +178,16 @@ export const createApp = async (deps?: AppDeps) => {
           database,
           fetchFn: deps?.fetchFn,
           logger: appLogger,
-          rateLimit: createUserTierRateLimit(database, rateLimitSettings, 'inference'),
+          rateLimit: inferenceRateLimit,
+        }),
+      )
+      .use(
+        createHostedAgentRoutes({
+          auth,
+          database,
+          settings,
+          logger: appLogger,
+          rateLimit: inferenceRateLimit,
         }),
       )
       .use(createConfigRoutes(settings))
