@@ -20,6 +20,7 @@ import { createErrorHandlingMiddleware } from '@/middleware/error-handling'
 import { createHttpLoggingMiddleware } from '@/middleware/http-logging'
 import {
   createAuthIpRateLimit,
+  createAuthPluginIpRateLimit,
   createIpTierRateLimit,
   createUserTierRateLimit,
   createRateLimitConsumer,
@@ -93,7 +94,13 @@ export const createApp = async (deps?: AppDeps) => {
   // Create auth plugin with the database instance (tests may inject their own auth)
   const { plugin: betterAuthPlugin, auth: createdAuth } = createBetterAuthPlugin(
     database,
-    createAuthIpRateLimit(database, ipRateLimitSettings),
+    createAuthPluginIpRateLimit(database, {
+      ...ipRateLimitSettings,
+      anonymousSignIn: {
+        max: settings.anonymousSignInRateLimitMax,
+        durationSecs: settings.anonymousSignInRateLimitWindowSecs,
+      },
+    }),
   )
   const auth = deps?.auth ?? createdAuth
 
