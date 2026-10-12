@@ -198,21 +198,21 @@ An agent is the assistant behind a conversation. Thunderbolt ships a built-in on
 
 `AGENT_ENABLED=true` mounts `POST /v1/agent/chat`, a stateless agent that runs inside the API: the client sends the whole conversation each turn and the server keeps nothing between requests. It needs a session (anonymous sessions are allowed), shares the `inference` rate limit and the [spending limits](#spending-limits), runs one reply at a time per user, and calls one model upstream. `AGENT_MODEL` takes one of two shapes: a Fireworks serverless id, `accounts/fireworks/models/<name>`, which runs on Fireworks with `FIREWORKS_API_KEY`, or a bare Anthropic id, which runs on Anthropic with `ANTHROPIC_API_KEY`. The API refuses to start on an id it does not support or when the provider's key is unset; Fireworks models in other accounts are not supported yet. Each supported id also needs a row in the inference price table, otherwise requests fail with `503 INFERENCE_PRICE_UNAVAILABLE`. The supported ids and their seeded prices are listed under [Model prices](./models.md#model-prices). The agent has no tools yet.
 
-The agent is also offered through agent discovery, and the discovery response names it as the default agent unless `ENABLED_AGENTS` excludes it. Excluding `hosted-agent` there hides it from discovery but does not unmount the route, the same as the Haystack route. The app starts honouring the default in an upcoming release.
+The agent is also offered through agent discovery, and the discovery response names it as the default agent unless `ENABLED_AGENTS` excludes it. Excluding `hosted-agent` there hides it from discovery but does not unmount the route, the same as the Haystack route. A brand-new chat opens on it unless the user has already chosen: an agent picked before (the remembered choice syncs across their devices), or a model, which counts as choosing the built-in agent. Existing chats keep their agent, and a user can switch from the chat header at any time.
 
 A request may carry at most 2 MB and 200 messages (`413` and `400` beyond that), and a reply stops at 8,192 output tokens or after 2 minutes upstream. The agent takes text only, whatever the model: a request carrying a file attachment is refused with `400 AGENT_FILES_UNSUPPORTED`.
 
-| Variable                          | Default     | What it does                                                                |
-| --------------------------------- | ----------- | --------------------------------------------------------------------------- |
-| `AGENT_ENABLED`                   | `false`     | Mounts the hosted agent. When `false` the route does not exist.             |
-| `AGENT_MODEL`                     | empty       | Model the agent uses; its id picks the provider. Required when enabled.     |
-| `AGENT_MAX_STEPS`                 | `8`         | Most tool-call steps per run. No effect until MCP tools land.               |
-| `AGENT_SYSTEM_PROMPT`             | empty       | System prompt for the agent.                                                |
-| `AGENT_MCP_SERVERS`               | empty       | JSON array of MCP servers the agent may call. No effect yet.                |
-| `AGENT_NAME`                      | `Assistant` | Name shown when clients discover the agent.                                 |
-| `AGENT_DESCRIPTION`               | empty       | Description shown when clients discover the agent.                          |
-| `AGENT_ICON`                      | empty       | Icon shown when clients discover the agent.                                 |
-| `ALLOW_ANONYMOUS_AGENT_DISCOVERY` | `false`     | Lets anonymous sessions discover agents; they see only anonymous-safe ones. |
+| Variable                          | Default     | What it does                                                                                                               |
+| --------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `AGENT_ENABLED`                   | `false`     | Mounts the hosted agent. When `false` the route does not exist.                                                            |
+| `AGENT_MODEL`                     | empty       | Model the agent uses; its id picks the provider. Required when enabled.                                                    |
+| `AGENT_MAX_STEPS`                 | `8`         | Most tool-call steps per run. No effect until MCP tools land.                                                              |
+| `AGENT_SYSTEM_PROMPT`             | empty       | System prompt for the agent.                                                                                               |
+| `AGENT_MCP_SERVERS`               | empty       | JSON array of MCP servers the agent may call. No effect yet.                                                               |
+| `AGENT_NAME`                      | `Assistant` | Name shown when clients discover the agent.                                                                                |
+| `AGENT_DESCRIPTION`               | empty       | Description shown when clients discover the agent.                                                                         |
+| `AGENT_ICON`                      | empty       | Icon shown for the agent: `bot`, `brain`, `globe`, `message-circle`, `server` or `sparkles`. Anything else shows `server`. |
+| `ALLOW_ANONYMOUS_AGENT_DISCOVERY` | `false`     | Lets anonymous sessions discover agents; they see only anonymous-safe ones.                                                |
 
 ### Deepset (Haystack) pipelines
 
