@@ -53,6 +53,7 @@ Render prompts once for every value below and never overwrites them afterwards. 
 | `INFERENCE_QUOTA_ANONYMOUS_5H_CENTS`, `INFERENCE_QUOTA_ANONYMOUS_7D_CENTS`                   | Each visitor's spending cap, in cents. Enter numbers: a blank value stops the API at startup.                                                                                                  |
 | `ANONYMOUS_SIGN_IN_RATE_LIMIT_MAX`, `ANONYMOUS_SIGN_IN_RATE_LIMIT_WINDOW_SECS`               | Blank keeps the defaults, 10 per 60 seconds. Without a captcha provider the API refuses to start with more than 10 or a window under 60 seconds.                                               |
 | `ANONYMOUS_SIGN_IN_GLOBAL_RATE_LIMIT_MAX`, `ANONYMOUS_SIGN_IN_GLOBAL_RATE_LIMIT_WINDOW_SECS` | Blank keeps the defaults, 2000 per 3600 seconds across the whole deployment. Size it to the visitors you expect: once it runs out, no new visitor can start a session until the window resets. |
+| `ANONYMOUS_USER_IDLE_DAYS`                                                                   | Blank keeps the default, 30 days: a visitor idle that long is deleted with their usage records. Enter `0` to keep every visitor until teardown.                                                |
 | `VITE_CAPTCHA_PROVIDER`                                                                      | `altcha` to turn on the captcha, or blank. Set it together with `CAPTCHA_PROVIDER`: both or neither. A change means a rebuild.                                                                 |
 | `CAPTCHA_PROVIDER`                                                                           | `altcha` together with `VITE_CAPTCHA_PROVIDER`, or blank for none. See [ALTCHA](./configuration.md#altcha).                                                                                    |
 | `ALTCHA_SECRET`                                                                              | With `altcha`, a key of at least 32 characters: `openssl rand -hex 32`. Otherwise blank.                                                                                                       |
@@ -82,7 +83,7 @@ The API can report users, turns, tokens and spend for any window, split between 
 bun run usage-report --from 2026-10-26 --to 2026-11-02 --tz Europe/London
 ```
 
-`--from` is inclusive and `--to` exclusive. Add `--json` for machine-readable output. Usage rows are deleted along with their user, so run the report before removing users or the database.
+`--from` is inclusive and `--to` exclusive. Add `--json` for machine-readable output. Usage rows are deleted along with their user, and the API deletes each visitor about `ANONYMOUS_USER_IDLE_DAYS` days (default 30) after their own last activity, so a visitor who left on the first day can be gone before a report run weeks later. For an event, set it to `0` until the report has been run, or to at least the event's length plus the days until the report runs.
 
 ## Freeze before the event
 
@@ -100,7 +101,7 @@ Ship a fix during the event the same way, by deploying its commit.
 2. Disconnect the Blueprint. While it is connected, Render recreates a deleted resource on the next sync.
 3. Delete both services and the database.
 
-Deleting the database removes everything the deployment kept on the server: the anonymous accounts and sessions, the usage records and the rate-limit counters. The server keeps no conversations, since the hosted agent is stateless and nothing syncs. Visitors' chats stay in their browsers until they clear the site's data. PostHog data, if you collected any, lives in that project and is removed there.
+Before teardown, the API already deletes each visitor about `ANONYMOUS_USER_IDLE_DAYS` days after their last activity, with their sessions and usage records (see [Anonymous sign-in](./configuration.md#anonymous-sign-in)). Keep it at `0` until the usage report has been run, or at least the event's length plus the days until the report runs. Deleting the database removes everything the deployment kept on the server: the anonymous accounts and sessions, the usage records and the rate-limit counters. The server keeps no conversations, since the hosted agent is stateless and nothing syncs. Visitors' chats stay in their browsers until they clear the site's data. PostHog data, if you collected any, lives in that project and is removed there.
 
 ## Limits
 
