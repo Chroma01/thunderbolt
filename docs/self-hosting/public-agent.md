@@ -48,6 +48,7 @@ Render prompts once for every value below and never overwrites them afterwards. 
 | `AGENT_MODEL`                                                                                | `claude-opus-5-5` (Anthropic), `accounts/fireworks/models/glm-5p3` or `accounts/fireworks/models/minimax-m3` (Fireworks). The API refuses to start on any other id.                            |
 | `AGENT_SYSTEM_PROMPT`                                                                        | The agent's knowledge (next section).                                                                                                                                                          |
 | `AGENT_NAME`, `AGENT_DESCRIPTION`, `AGENT_ICON`                                              | How the agent is presented.                                                                                                                                                                    |
+| `AGENT_TIMEZONE`                                                                             | The venue's IANA time zone, such as `Europe/London`, for the date and hour the agent is told. UTC when blank.                                                                                  |
 | `AGENT_MAX_STEPS`, `AGENT_MCP_SERVERS`                                                       | Blank. Neither has an effect until the agent has tools.                                                                                                                                        |
 | `INFERENCE_QUOTA_ANONYMOUS_5H_CENTS`, `INFERENCE_QUOTA_ANONYMOUS_7D_CENTS`                   | Each visitor's spending cap, in cents. Enter numbers: a blank value stops the API at startup.                                                                                                  |
 | `ANONYMOUS_SIGN_IN_RATE_LIMIT_MAX`, `ANONYMOUS_SIGN_IN_RATE_LIMIT_WINDOW_SECS`               | Blank keeps the defaults, 10 per 60 seconds. Without a captcha provider the API refuses to start with more than 10 or a window under 60 seconds.                                               |
@@ -62,7 +63,7 @@ The rest is fixed by the Blueprint. On the API it turns on anonymous sessions (`
 | Fixed material: an FAQ, venue facts, policies  | `AGENT_SYSTEM_PROMPT`. It is sent with every request, so write facts, not prose. Keep the source out of this repository.    |
 | Data that changes: a schedule, rooms, speakers | MCP servers listed in `AGENT_MCP_SERVERS`, once the agent has tools. Until then, have the prompt say where the schedule is. |
 
-The agent is not told the current date or time yet, so questions such as "what's on this afternoon?" need the schedule tools.
+The agent is told the current date and hour in `AGENT_TIMEZONE`, but it still needs the schedule tools to answer questions such as "what's on this afternoon?".
 
 ## Headers
 
