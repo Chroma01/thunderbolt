@@ -10,7 +10,7 @@ type Step = {
   uses?: string
   run?: string
   with?: { ref?: string; tag_name?: string; files?: string }
-  env?: { PRERELEASE?: string }
+  env?: { PRERELEASE?: string; LATEST?: string }
 }
 
 type Workflow = {
@@ -66,6 +66,8 @@ describe('release tag wiring', () => {
     const publish = steps.find((step) => step.run?.includes('gh release edit'))
     expect(publish?.run).toContain('gh release edit "$RELEASE_TAG"')
     expect(publish?.run).toContain('--prerelease="${PRERELEASE}"')
-    expect(publish?.env?.PRERELEASE).toBe("${{ inputs.nightly || endsWith(env.RELEASE_TAG, '-rc') }}")
+    expect(publish?.env?.PRERELEASE).toBe("${{ endsWith(env.RELEASE_TAG, '-rc') }}")
+    expect(publish?.run).toContain('--latest="$LATEST"')
+    expect(publish?.env?.LATEST).toBe("${{ inputs.latest && !endsWith(env.RELEASE_TAG, '-rc') }}")
   })
 })
