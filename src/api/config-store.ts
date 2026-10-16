@@ -21,6 +21,11 @@ export type AppConfig = {
   builtInAgentEnabled?: boolean
   allowCustomAgents?: boolean
   debugTranscriptsEnabled?: boolean
+  /** Whether the deployment offers passkeys (sign-in and sync unlock). False or
+   *  absent (an older backend) = off; the frontend hides all passkey UI. */
+  passkeyEnabled?: boolean
+  /** The WebAuthn RP ID passkeys are registered under. Absent = the page's hostname. */
+  passkeyRpId?: string
   /** Minimum semver string the server allows. Clients below this are hard-blocked
    *  until they upgrade. Absent/empty = no enforcement. */
   minAppVersion?: string
@@ -75,3 +80,7 @@ export const selectAllowCustomAgents = (config: AppConfig): boolean => config.al
 /** Whether the server explicitly accepts debug transcript uploads. Absent
  * config is disabled because standalone mode has no backend recipient. */
 export const selectDebugTranscriptsEnabled = (config: AppConfig): boolean => config.debugTranscriptsEnabled === true
+
+/** Whether the deployment offers passkeys (sign-in and sync unlock). Absent config (offline/
+ * standalone) is disabled — passkeys need the backend plugin to be registered. */
+export const selectPasskeyEnabled = (config: AppConfig): boolean => config.passkeyEnabled === true
