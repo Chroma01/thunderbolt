@@ -46,13 +46,13 @@ Don't use the embedded `pglite` driver outside evaluation and testing. The sync 
 
 Pick one mode.
 
-| Variable               | Default                                   | What it does                                                                                                           |
-| ---------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `AUTH_MODE`            | `consumer`                                | `consumer` for email sign-in codes, `oidc` or `saml` for enterprise SSO.                                               |
-| `AUTH_ALLOW_ANONYMOUS` | `false`                                   | Lets visitors use the app without an account. Off by default, and the API rejects anonymous sign-in outright when off. |
-| `TRUSTED_ORIGINS`      | `http://localhost:1420,tauri://localhost` | Comma-separated origins accepted for sign-in callbacks and identity provider discovery.                                |
+| Variable               | Default                                                          | What it does                                                                                                           |
+| ---------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `AUTH_MODE`            | `consumer`                                                       | `consumer` for email sign-in codes, `oidc` or `saml` for enterprise SSO.                                               |
+| `AUTH_ALLOW_ANONYMOUS` | `false`                                                          | Lets visitors use the app without an account. Off by default, and the API rejects anonymous sign-in outright when off. |
+| `TRUSTED_ORIGINS`      | `http://localhost:1420,tauri://localhost,http://tauri.localhost` | Comma-separated origins accepted for sign-in callbacks and identity provider discovery.                                |
 
-`tauri://localhost` (the desktop and mobile apps) and the `BETTER_AUTH_URL` origin are always accepted, whatever you set.
+`tauri://localhost` and `http://tauri.localhost` (the desktop and mobile apps) and the `BETTER_AUTH_URL` origin are always accepted, whatever you set.
 
 ### First-time email sign-in
 
@@ -117,17 +117,18 @@ Users create personal access tokens in the app so a script or the command-line c
 
 Lets users sign in with a passkey, and unlock sync on a new device with it instead of approving it from another device. Consumer sign-in only; ignored under OIDC and SAML.
 
-| Variable          | Default              | What it does                                                                                      |
-| ----------------- | -------------------- | ------------------------------------------------------------------------------------------------- |
-| `PASSKEY_ENABLED` | `false`              | Turns passkeys on.                                                                                |
-| `PASSKEY_RP_ID`   | `APP_URL`'s hostname | WebAuthn Relying Party ID. Set it only to share passkeys across subdomains (use the apex domain). |
-| `PASSKEY_RP_NAME` | `Thunderbolt`        | Name shown in the browser's passkey prompt.                                                       |
+| Variable                  | Default              | What it does                                                                                                                                            |
+| ------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PASSKEY_ENABLED`         | `false`              | Turns passkeys on.                                                                                                                                      |
+| `PASSKEY_RP_ID`           | `APP_URL`'s hostname | WebAuthn Relying Party ID. Set it only to share passkeys across subdomains (use the apex domain).                                                       |
+| `PASSKEY_RP_NAME`         | `Thunderbolt`        | Name shown in the browser's passkey prompt.                                                                                                             |
+| `PASSKEY_ANDROID_ORIGINS` | empty                | Comma-separated `android:apk-key-hash:<hash>` origins of the Android app's signing keys. The Android app's passkeys verify only when its key is listed. |
 
 > [!WARNING]
 > The Relying Party ID is permanent once users register passkeys. Changing it — including by moving `APP_URL` to a new domain while `PASSKEY_RP_ID` is unset — orphans every passkey: users can no longer sign in with them or use them to unlock sync.
 
 > [!NOTE]
-> The official macOS and iOS apps can only use passkeys for `app.thunderbolt.io`, the domain their signature is associated with. Against any other Relying Party ID they hide the passkey options, so passkeys on a self-hosted deployment work in the browser only.
+> The official macOS, iOS and Android apps can only use passkeys for `app.thunderbolt.io`, the domain their signature is associated with. Against any other Relying Party ID they hide the passkey options, so passkeys on a self-hosted deployment work in the browser only.
 
 ## Models and inference
 
