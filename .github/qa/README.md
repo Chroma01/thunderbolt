@@ -73,7 +73,7 @@ code from. The fallback is a checkout the job's user cannot write during replay.
    Dry run unless `--live`.
 6. **fix** (off by default, `fix.ts` and `fix.md`): at most 3 fake-AI tickets in fixable areas. The original spec
    must pass 3 times on the patch before `publish` opens a draft PR on `qa-fix/<fp>`; otherwise the ticket gets
-   `human required`. `preview-deploy.yml` deploys no preview for `qa-fix/*` PRs.
+   `Human Required`. `preview-deploy.yml` deploys no preview for `qa-fix/*` PRs.
 7. **report** (`report.ts summary`): the job summary.
 
 Output goes to `qa-out*/` (gitignored). `fixtures/` holds the files the charters upload.
@@ -193,8 +193,9 @@ Serve `qa-dist-canary`, run each canary's charter into `qa-out-canary` and repla
 /tmp/qa-canaries.json`.
 
 **Fix agent:** run it in a separate checkout (it edits the working tree), with
-`.github/qa/scripts/stack.sh serve dev` from that checkout and the flags of the `fix` job. Collect the patch like
-the workflow does, then `bun .github/qa/scripts/fix.ts publish --out qa-out --fp <fp>` without `--live` shows the
+`.github/qa/scripts/stack.sh serve dev` from that checkout (it serves the app on 1424 with onboarding skipped and on
+1425 with onboarding on, so a fix for an onboarding finding can be verified) and the flags of the `fix` job.
+Collect the patch like the workflow does, then `bun .github/qa/scripts/fix.ts publish --out qa-out --fp <fp>` without `--live` shows the
 commit and the PR it would open.
 
 Every out dir must sit directly under the repo root: the specs import `../../../e2e/helpers`.
@@ -278,8 +279,8 @@ secret would be used without warning. `notify` uses the existing repository secr
 
 Team Thunderbolt needs these labels, or the filer stops and lists the missing ones:
 
-- `qa-agent`, `Bug`, `security` (filing)
-- `human required` (tickets the fix agent must not touch)
+- `qa-agent`, `Bug`, `Security` (filing)
+- `Human Required` (tickets the fix agent must not touch)
 - `qa:valid`, `qa:not-a-bug`, `qa:duplicate`, `qa:env-artifact` (triage; the scorecard reads them to compute
   precision, and filing falls back to a dry run while precision stays under 70% over 8+ triaged tickets that are
   not duplicates)
