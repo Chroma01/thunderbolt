@@ -9,7 +9,8 @@ import { basename, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { z } from 'zod'
 import type { Canary } from './canaries'
-import { type Filed, sanitize, type Scorecard } from './file-findings'
+import type { Filed, Scorecard } from './file-findings'
+import { sanitize } from './sanitize'
 import { type FindingFile, loadFindings, parseSession, realAiCharters } from './findings'
 import { selects } from './legs'
 import type { Verified, VerifiedFinding } from './verify'
@@ -148,27 +149,45 @@ export type AttemptFile = { id: string; attempt?: Attempt }
 export type TranscriptMessage = {
   message: {
     content: (
-      | { type: 'tool_use'; id: string; name: string; input?: { file_path?: string } }
+      | { type: 'tool_use'; id: string; name: string; input?: { file_path?: string; yaml?: string } }
       | { type: 'tool_result'; tool_use_id: string; content: string }
     )[]
   }
 }
-type Step = { kind: 'call'; tool: string; path?: string } | { kind: 'result'; tool: string; text: string }
+type Step =
+  | { kind: 'call'; tool: string; path?: string; yaml?: string }
+  | { kind: 'result'; tool: string; text: string }
+
+const maestroPrefix = 'mcp__maestro__'
 
 const toSteps = (transcript: TranscriptMessage[]): Step[] => {
-  const blocks = transcript.flatMap((m) => m.message.content)
-  const names = new Map(blocks.flatMap((b) => (b.type === 'tool_use' ? [[b.id, b.name] as const] : [])))
+  const all = transcript.flatMap((m) => m.message.content)
+  const names = new Map(all.flatMap((b) => (b.type === 'tool_use' ? [[b.id, b.name] as const] : [])))
+  // A run the gate refused did nothing and its reply echoes the model's own text, so call and reply both go.
+  const denied = new Set(
+    all.flatMap((b) =>
+      b.type === 'tool_result' && names.get(b.tool_use_id)?.startsWith(maestroPrefix) && b.content.startsWith('denied:')
+        ? [b.tool_use_id]
+        : [],
+    ),
+  )
+  const blocks = all.filter((b) => !denied.has(b.type === 'tool_use' ? b.id : b.tool_use_id))
   return blocks.map(
     (b): Step =>
       b.type === 'tool_use'
-        ? { kind: 'call', tool: b.name, path: b.input?.file_path }
+        ? { kind: 'call', tool: b.name, path: b.input?.file_path, yaml: b.input?.yaml }
         : { kind: 'result', tool: names.get(b.tool_use_id) ?? '', text: b.content },
   )
 }
 
-/** `click` for `mcp__playwright__browser_click` (and device B's `mcp__playwright_b__…`); undefined for other tools. */
-const browserTool = (tool: string) => /^mcp__playwright(?:_b)?__browser_(\w+)$/.exec(tool)?.[1]
+/**
+ * `click` for `mcp__playwright__browser_click` (and device B's `mcp__playwright_b__…`), `run` for
+ * `mcp__maestro__run`; undefined for other tools.
+ */
+const browserTool = (tool: string) => /^mcp__(?:playwright(?:_b)?__browser_|maestro__)(\w+)$/.exec(tool)?.[1]
 const readyLine = '[qa-layout] ready'
+/** The gate puts the probe's ready line on a line of its own, so text inside another line does not match. */
+const nativeReady = /^\[qa-layout\] ready/m
 const readOnlyTools = new Set([
   'snapshot',
   'console_messages',
@@ -178,6 +197,9 @@ const readOnlyTools = new Set([
   'find',
   'take_screenshot',
   'wait_for',
+  'inspect_screen',
+  'read_logs',
+  'cheat_sheet',
 ])
 const isAction = (step: Step) => {
   const tool = step.kind === 'call' ? browserTool(step.tool) : undefined
@@ -210,24 +232,32 @@ const probeRan = async (result: string, sessionDir: string, readLog: (path: stri
 }
 
 /**
- * Page loads in a session and how many of them did not show `[qa-layout] ready`. Back is not a load: it is a
- * same-document history move in this SPA, and the probe runs on document loads only. The MCP puts no console text in a
- * navigate result, only a count and a link to the log lines the load wrote, so each link is followed (`readLog`)
- * under `sessionDir`. A load with no link, or whose linked lines lack the ready line, counts as missing.
+ * Screens in a session and how many of them did not show `[qa-layout] ready`: page loads and native `run` calls.
+ * Back is not a load: it is a same-document history move in this SPA, and the probe runs on document loads only.
+ * The Playwright MCP puts no console text in a navigate result, only a count and a link to the log lines the load
+ * wrote, so each link is followed (`readLog`) under `sessionDir`. A load with no link, or whose linked lines lack
+ * the ready line, counts as missing. The Maestro gate appends the ready line to a `run` result itself.
  */
 export const probeGaps = async (
   transcript: TranscriptMessage[],
   sessionDir: string,
   readLog = readConsoleLog,
 ): Promise<{ loads: number; missing: number }> => {
-  const loads = toSteps(transcript).flatMap((step) =>
-    step.kind === 'result' && browserTool(step.tool) === 'navigate' ? [step.text] : [],
-  )
-  const ran = await Promise.all(loads.map((result) => probeRan(result, sessionDir, readLog)))
-  return { loads: loads.length, missing: ran.filter((ok) => !ok).length }
+  const screens = toSteps(transcript).flatMap((step) => {
+    if (step.kind !== 'result') return []
+    if (browserTool(step.tool) === 'run') return [Promise.resolve(nativeReady.test(step.text))]
+    return browserTool(step.tool) === 'navigate' ? [probeRan(step.text, sessionDir, readLog)] : []
+  })
+  const ran = await Promise.all(screens)
+  return { loads: ran.length, missing: ran.filter((ok) => !ok).length }
 }
+// A relaunch, as the gate's allow list forces it: launchApp right after stopApp or killApp, as top-level commands.
+const relaunch = /^- (?:stopApp|killApp)\b[\s\S]*?^- launchApp\b/m
+/** A reload: a page navigation, or on native a `run` whose commands stop the app and launch it again. */
 const isNavigation = (step: Step) =>
-  step.kind === 'call' && ['navigate', 'navigate_back'].includes(browserTool(step.tool) ?? '')
+  step.kind === 'call' &&
+  (['navigate', 'navigate_back'].includes(browserTool(step.tool) ?? '') ||
+    (browserTool(step.tool) === 'run' && relaunch.test(step.yaml ?? '')))
 /** The id of the attempt record a Write call wrote; undefined for every other step. */
 const recordWritten = (step: Step) =>
   step.kind === 'call' && step.tool === 'Write' ? /\/attempts\/([^/]+)\.json$/.exec(step.path ?? '')?.[1] : undefined
@@ -245,7 +275,20 @@ const normalize = (text: string) =>
     .trim()
 /** A browser tool echoes the code it ran, typed text included, which says nothing about the page. */
 const echoedCode = /### Ran Playwright code\n```\w*\n[\s\S]*?\n```/g
+/** What the gate adds to a Maestro reply on its own: the `run` success envelope, `[qa-gate]` notes, the saved path. */
+const gateText = /^(?:\{"success":|\[qa-gate\]|Saved to ).*$/gm
 const minQuote = 10
+
+/**
+ * The part of a tool result that a quote may come from: what the app or the page showed. Native `cheat_sheet` and
+ * `take_screenshot` replies say nothing about the app, and the gate's own text is fixed, so none of it counts.
+ */
+const quotable = (step: Step) => {
+  const tool = browserTool(step.tool)
+  if (step.kind !== 'result' || tool === undefined) return ''
+  if (!step.tool.startsWith(maestroPrefix)) return step.text.replace(echoedCode, '')
+  return ['cheat_sheet', 'take_screenshot'].includes(tool) ? '' : step.text.replace(gateText, '')
+}
 
 /**
  * Why an attempt's `observed` quote is not backed by the transcript, or undefined when it is. The quote must be in a
@@ -263,13 +306,7 @@ const evidenceProblem = (steps: Step[], { id, attempt }: { id: string; attempt: 
     1 +
     steps.findLastIndex((step, i) => i < end && recordWritten(step) !== undefined && steps.slice(i, end).some(isAction))
   const quoted = steps.flatMap((step, i) =>
-    i >= start &&
-    i < end &&
-    step.kind === 'result' &&
-    browserTool(step.tool) !== undefined &&
-    normalize(step.text.replace(echoedCode, '')).includes(quote)
-      ? [i]
-      : [],
+    i >= start && i < end && normalize(quotable(step)).includes(quote) ? [i] : [],
   )
   if (quoted.length === 0) return 'quote not in a browser tool result of this attempt'
   const first = (pick: (step: Step) => boolean) => steps.findIndex((step, i) => i >= start && pick(step))
@@ -366,8 +403,7 @@ const probeSection = (probe: ReportInput['probe'] = new Map()) =>
         '',
         '## Layout probe',
         ...[...probe].map(
-          ([charter, { loads, missing }]) =>
-            `- **${charter}**: layout probe missing on ${missing} of ${loads} page loads`,
+          ([charter, { loads, missing }]) => `- **${charter}**: ${missing} of ${loads} screens without a measurement`,
         ),
       ]
 
@@ -411,7 +447,9 @@ const flakyLine = ({ charterDir, id, finding, replay }: VerifiedFinding) => {
     finding.area === 'security'
       ? 'security finding, text withheld'
       : `${safe(finding.title, 150)} — ${finding.oracle.type}: "${safe(finding.oracle.evidence, 300)}"`
-  return `- ${charterDir}/${id}: ${text} (failed ${replay.failed}/${replay.runs} replays)`
+  const inconclusive = replay.inconclusive ? `, ${replay.inconclusive} inconclusive` : ''
+  const reason = replay.reason ? `; ${safe(replay.reason, 200)}` : ''
+  return `- ${charterDir}/${id}: ${text} (failed ${replay.failed}/${replay.runs} replays${inconclusive}${reason})`
 }
 
 /** Fix sessions record their metrics as `fix-<fp>`; every other session explored a charter. */

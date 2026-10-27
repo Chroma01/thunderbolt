@@ -38,8 +38,33 @@ const oracleTypes = [
   'ai-reported-failure',
 ] as const
 
+/** One entry of `platforms.json`. The native ones (`maestro`) also name the app they drive. */
+export type Platform = {
+  id: string
+  driver: 'playwright' | 'maestro'
+  runner: string
+  viewport: string
+  mcp: string
+  /** Whether the platform's sessions can use the app's real AI providers. */
+  realAi: boolean
+  appId?: string
+  appName?: string
+}
+
 /** The platform ids of `platforms.json`. They never contain a hyphen, so a session id ends at the last one. */
 export const platformIds = platforms.map((platform) => platform.id)
+
+/** The ids of the platforms the Maestro driver runs. */
+export const nativePlatformIds = (platforms as Platform[])
+  .filter((platform) => platform.driver === 'maestro')
+  .map((platform) => platform.id)
+
+/** The `platforms.json` entry for an id; throws for an unknown id. */
+export const platformOf = (id: string): Platform => {
+  const platform = (platforms as Platform[]).find((entry) => entry.id === id)
+  if (!platform) throw new Error(`unknown platform: ${id}`)
+  return platform
+}
 
 /** An explore session: `<charter>-<platform>`, or `free-<case>-<platform>` for a free session. */
 export type Session = { charter: string; platform: string }
@@ -52,24 +77,33 @@ export const parseSession = (session: string): Session => {
   return { charter: session.slice(0, cut), platform }
 }
 
+const realAiPlatformIds = platformIds.filter((id) => platformOf(id).realAi)
+
 /**
- * Sessions explored with the app's real AI providers: three charters on every platform, and the free session of
- * every case on every platform (`free-<case>-<platform>`). Their findings replay on a stack with the real providers
- * too, where two failed runs in three confirm one, and they never go to the fix agent, whose check runs on the fake
- * AI. The workflow reads this set to plan its legs.
+ * Sessions explored with the app's real AI providers: three charters and the free session of every case
+ * (`free-<case>-<platform>`), on every platform with `realAi` (iOS has none). Their findings replay on a stack with
+ * the real providers too, where two failed runs in three confirm one. A web fix is checked again on the real
+ * providers; a native (Android) fix is checked with no key on the fake AI, where its repro flow must fail without the
+ * patch and pass with it. The workflow reads this set to plan its legs.
  */
 export const realAiCharters = new Set([
   ...['c3-models-providers', 'c4-skills-projects', 'c5-widgets-connections'].flatMap((charter) =>
-    platformIds.map((platform) => `${charter}-${platform}`),
+    realAiPlatformIds.map((platform) => `${charter}-${platform}`),
   ),
-  ...journeys.flatMap((journey) => platformIds.map((platform) => `free-${journey.id}-${platform}`)),
+  ...journeys.flatMap((journey) => realAiPlatformIds.map((platform) => `free-${journey.id}-${platform}`)),
 ])
 
 export type Area = (typeof areas)[number]
 export type Severity = 'Urgent' | 'High' | 'Medium' | 'Low'
 
-/** A browser screenshot's path inside the session dir: `mcp/<file>`, or `mcp-b/<file>` for c7's second device. */
-export const screenshotFile = z.string().regex(/^mcp(-b)?\/[\w.-]+\.(png|jpe?g)$/)
+/**
+ * A screenshot's path inside the session dir: the browser's `mcp/<file>` (`mcp-b/<file>` for c7's second device), or
+ * the Maestro gate's `maestro/shot-<n>.<ext>`.
+ */
+export const screenshotFile = z.string().regex(/^(mcp(-b)?\/[\w.-]+|maestro\/shot-\d+)\.(png|jpe?g)$/)
+
+/** The Maestro flow that proves a native finding, inside the session dir. */
+export const reproFlowFile = z.string().regex(/^repro\/[\w-]+\.yaml$/)
 
 const findingFields = z.object({
   title: z.string().min(1),
@@ -85,6 +119,7 @@ const findingFields = z.object({
     .string()
     .regex(/^repro\/[\w-]+\.spec\.ts$/)
     .optional(),
+  repro_flow: reproFlowFile.optional(),
   screenshot: screenshotFile.optional(),
   /** The accessible name of the element a visual finding is about, as `<role> "<name>"`. */
   element: z.string().optional(),
@@ -92,10 +127,17 @@ const findingFields = z.object({
   function: z.string().optional(),
 })
 
-/** A visual finding is proven by its screenshot, every other one by a repro spec. */
-const provable = (finding: { oracle: { type: string }; repro_spec?: string; screenshot?: string }) =>
-  finding.oracle.type === 'visual' ? finding.screenshot !== undefined : finding.repro_spec !== undefined
-const provableMessage = 'a visual finding needs a screenshot, any other finding a repro_spec'
+type Proof = { oracle: { type: string }; repro_spec?: string; repro_flow?: string; screenshot?: string }
+
+/**
+ * A visual finding is proven by its screenshot, every other one by exactly one repro. Which repro its platform needs
+ * depends on the session dir, which the schema cannot see: `sessionProblem` checks that.
+ */
+const provable = (finding: Proof) =>
+  finding.oracle.type === 'visual'
+    ? finding.screenshot !== undefined
+    : (finding.repro_spec === undefined) !== (finding.repro_flow === undefined)
+const provableMessage = 'a visual finding needs a screenshot, any other finding one of repro_spec and repro_flow'
 
 /** A finding that passed the oracle check: a known oracle type backed by quoted evidence. */
 export const findingSchema = findingFields.refine(provable, provableMessage)
@@ -143,11 +185,44 @@ export const loadFindings = async (outDir: string) => {
 /** Oracle gate: a finding without a known oracle type and quoted evidence is only an observation. */
 export const hasOracle = (finding: RawFinding): finding is Finding => findingSchema.safeParse(finding).success
 
+const sessionOf = (dir: string) => {
+  try {
+    return parseSession(dir)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Why a finding does not fit the session dir it was written in, or undefined when it does. The dir decides, never the
+ * model-written `charter` or `viewport`: a web session proves a finding with a repro spec, a native one with a repro
+ * flow, and c7 on Android takes either (a flow for the app, a spec for its browser). Replay sets the `viewport` from
+ * the dir.
+ */
+export const sessionProblem = ({ charterDir, finding }: FindingFile): string | undefined => {
+  const session = /^[\w-]+$/.test(charterDir) ? sessionOf(charterDir) : undefined
+  if (!session) return `not a session dir: ${charterDir}`
+  if (finding.oracle.type === 'visual') return undefined
+  if (!nativePlatformIds.includes(session.platform)) {
+    return finding.repro_flow ? 'a web session proves a finding with a repro_spec, not a repro_flow' : undefined
+  }
+  if (finding.repro_spec && session.charter !== 'c7-two-devices') {
+    return 'a native session proves a finding with a repro_flow; only c7 on Android also takes a repro_spec'
+  }
+  return undefined
+}
+
 /**
  * Import specifiers a repro spec may use. Assumes specs are replayed where the explorer wrote them,
- * `qa-out/<charter>/repro/<n>.spec.ts`, so the repo's `e2e/helpers` and `.github/qa/layout` are three directories up.
+ * `qa-out/<charter>/repro/<n>.spec.ts`, so the repo's `e2e/helpers`, `.github/qa/layout` and `.github/qa/ports` (the
+ * onboarding URL, for a c1 spec) are three directories up.
  */
-const allowedImports = new Set(['@playwright/test', '../../../e2e/helpers', '../../../.github/qa/layout'])
+const allowedImports = new Set([
+  '@playwright/test',
+  '../../../e2e/helpers',
+  '../../../.github/qa/layout',
+  '../../../.github/qa/ports',
+])
 
 /** Rejected wherever they appear, as a variable, a property, or a literal key, so shadowing cannot hide them. */
 const forbiddenNames = new Set([
@@ -357,9 +432,28 @@ export const lintReproSpec = (source: string): string[] => {
   return reasons
 }
 
-/** Evidence with run-specific noise removed, so the same bug quoted in two runs compares equal. */
-const signature = (evidence: string) =>
-  evidence
+/**
+ * The title of the `test.step` in which a repro spec asserts the expected behaviour. Replay counts a failed run as the
+ * bug only when it failed inside this step; a failure on the way there (sign-in, navigation) proves nothing.
+ */
+export const bugStep = 'bug check'
+
+/** Why a repro spec has no `test.step(bugStep, …)` call; empty when it has one. */
+export const bugStepProblems = (source: string): string[] => {
+  const isBugStep = (node: ts.Node): boolean =>
+    (ts.isCallExpression(node) &&
+      node.expression.getText() === 'test.step' &&
+      node.arguments[0] !== undefined &&
+      ts.isStringLiteralLike(node.arguments[0]) &&
+      node.arguments[0].text === bugStep) ||
+    ts.forEachChild(node, isBugStep) === true
+  const sourceFile = ts.createSourceFile('repro.spec.ts', source, ts.ScriptTarget.Latest, true)
+  return isBugStep(sourceFile) ? [] : [`no test.step('${bugStep}', …) holds the assertion`]
+}
+
+/** Evidence or a log line with run-specific noise removed, so the same bug quoted in two runs compares equal. */
+export const normalize = (text: string) =>
+  text
     .toLowerCase()
     .replace(/\?\S*/g, '') // query strings
     .replace(/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/g, '') // uuids
@@ -370,7 +464,9 @@ const signature = (evidence: string) =>
     .replace(/\d+/g, '')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 200)
+
+/** Normalized evidence, capped: the part of the dedupe key that says what went wrong. */
+export const signature = (evidence: string) => normalize(evidence).slice(0, 200)
 
 /**
  * Dedupe key for "the same bug" across runs and platforms, first 8 hex chars of a sha256:

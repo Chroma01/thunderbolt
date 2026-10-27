@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { computeScorecard, fileFindings, sanitize, shouldBrake } from './file-findings'
+import { computeScorecard, fileFindings, shouldBrake } from './file-findings'
+import { sanitize } from './sanitize'
 import { fingerprint, type RawFinding } from './findings'
 
 const runUrl = 'https://github.com/o/r/actions/runs/1'
@@ -382,6 +383,17 @@ describe('video', () => {
     expect(input.description).toContain('https://uploads.linear.app/a/v.webm')
     expect(uploads(api)[0].contentType).toBe('video/webm')
   })
+
+  test('uploads a native replay video as MP4', async () => {
+    const video = 'videos/ios-c2-chat-power-user-ios-run-4.mp4'
+    await writeVerified([{}], video)
+    await mkdir(join(outDir, 'videos'), { recursive: true })
+    await writeFile(join(outDir, video), 'video')
+    const api = fakeLinear()
+    await run(api.fetchFn)
+    expect(uploads(api)[0].contentType).toBe('video/mp4')
+    expect(created(api)[0].description).toContain('https://uploads.linear.app/a/')
+  })
 })
 
 describe('one ticket per bug across platforms', () => {
@@ -413,11 +425,12 @@ describe('one ticket per bug across platforms', () => {
 })
 
 describe('visual findings', () => {
-  test('a visual ticket is Human Required and shows its screenshot', async () => {
+  test('a visual ticket is left to the fix agent, not Human Required, and shows its screenshot', async () => {
     await writeVerified([visualVerified({ screenshot: 'mcp/page-1.png' })])
     const api = fakeLinear({ labels: ['qa-agent', 'Bug', 'Security', 'Human Required'] })
     await run(api.fetchFn, { live: true })
-    expect(created(api)[0].labelIds).toContain('l-Human Required')
+    expect(created(api)[0].labelIds).not.toContain('l-Human Required')
+    expect(created(api)[0].labelIds).toContain('l-qa-agent')
     expect(uploads(api)[0].contentType).toBe('image/png')
     expect(created(api)[0].description).toContain('![Screenshot](https://uploads.linear.app/a/page-1.png)')
     expect(created(api)[0].description).toContain('**Element:** button "Continue"')
@@ -436,7 +449,7 @@ describe('visual findings', () => {
     await writeVerified([visualVerified({ screenshot: 'mcp/page-1.png' })])
     await writeFile(join(outDir, 'c2-chat', 'mcp', 'page-1.png'), '<svg onload="x()">')
     const api = fakeLinear()
-    await expect(run(api.fetchFn)).rejects.toThrow('not a PNG, JPEG or WebM file')
+    await expect(run(api.fetchFn)).rejects.toThrow('not a PNG, JPEG, WebM or MP4 file')
     expect(uploads(api)).toEqual([])
   })
 
@@ -446,6 +459,32 @@ describe('visual findings', () => {
     await run(api.fetchFn, { live: true })
     expect(created(api)).toHaveLength(1)
     expect(uploads(api)).toEqual([])
+  })
+
+  test('an Android layout finding is held back until an Android sweep, and its iOS twin is still filed', async () => {
+    const layout = { type: 'layout', evidence: '[qa-layout] covered button "Preferences"' }
+    const native = { oracle: layout, repro_spec: undefined, repro_flow: 'repro/1.yaml' }
+    // The Android keyboard line comes from the tree rule, not the probe, and still waits for the sweep.
+    const keyboard = { type: 'layout', evidence: '[qa-layout] behind-keyboard textbox "Enter your name"' }
+    await writeVerified([
+      { ...native, viewport: 'ios' },
+      { ...native, viewport: 'android' },
+      { ...native, viewport: 'android', oracle: keyboard },
+      { viewport: 'android', repro_spec: undefined, repro_flow: 'repro/2.yaml' },
+    ])
+    const api = fakeLinear()
+
+    const filed = await run(api.fetchFn)
+
+    const held = 'Android layout finding, held back until the probe sweeps correct Android screens clean'
+    expect(filed.map((f) => [f.id, f.action, f.reason]).sort()).toEqual([
+      ['0', 'created', undefined],
+      ['1', 'refused', held],
+      ['2', 'refused', held],
+      ['3', 'created', undefined],
+    ])
+    const platforms = created(api).map((input) => /\*\*Platforms:\*\* \w+/.exec(input.description)?.[0])
+    expect(platforms.sort()).toEqual(['**Platforms:** android', '**Platforms:** ios'])
   })
 
   test.each([
