@@ -8,10 +8,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { lintReproSpec, type RawFinding } from './findings'
+import type { TranscriptMessage } from './report'
 import {
   judge,
   replay,
   replayEnv,
+  screenshotTaken,
+  worstJudgeCost,
   type CreateMessage,
   type ReplayReport,
   type RunReplay,
@@ -27,7 +30,7 @@ test('${title}', async ({ page }) => {
 })
 `
 
-const makeFinding = (title: string, oracle: RawFinding['oracle']): RawFinding => ({
+const makeFinding = (title: string, oracle: RawFinding['oracle']): RawFinding & { repro_spec: string } => ({
   title,
   area: 'chat',
   charter: 'c2-chat',
@@ -40,6 +43,58 @@ const makeFinding = (title: string, oracle: RawFinding['oracle']): RawFinding =>
 })
 
 const pageError = { type: 'page-error', evidence: 'TypeError: messages is undefined' }
+
+const shotFile = 'page-2026-10-19T16-08-14-750Z.png'
+
+/** A visual finding: a screenshot under the session's `mcp/` instead of a repro spec. */
+const makeVisual = (title: string, screenshot = `mcp/${shotFile}`): RawFinding => ({
+  ...makeFinding(title, { type: 'visual', evidence: 'The send button sits under the composer toolbar' }),
+  area: 'layout',
+  element: 'button "Send"',
+  function: 'chat-send',
+  screenshot,
+  repro_spec: undefined,
+})
+
+/**
+ * What Playwright MCP 0.0.83 returns for `browser_take_screenshot` without a filename, run with
+ * `--file-paths absolute`; transcript.json keeps the text block only, not the image.
+ */
+const screenshotResult = (dir: string, file = shotFile) =>
+  `### Result\n- [Screenshot of viewport](${dir}/${file})\n### Ran Playwright code\n\`\`\`js\n` +
+  `// Screenshot viewport and save it as ${dir}/${file}\nawait page.screenshot({\n  path: '${dir}/${file}',\n` +
+  `  scale: 'css',\n  type: 'png'\n});\n\`\`\`\n### Events\n` +
+  `- New console entries: ${dir}/console-2026-10-19T16-08-14-157Z.log#L2`
+const sessionDir = '/home/runner/work/thunderbolt/thunderbolt/qa-out/c2-chat'
+
+const callsOf = (steps: (readonly [string, string])[]): TranscriptMessage[] =>
+  steps.flatMap(([name, result], i) => [
+    { message: { content: [{ type: 'tool_use' as const, id: `t${i}`, name }] } },
+    { message: { content: [{ type: 'tool_result' as const, tool_use_id: `t${i}`, content: result }] } },
+  ])
+
+/** The start of a PNG of that size: its signature and IHDR chunk, all the screenshot checks read. */
+const pngOf = (width: number, height: number) => {
+  const ihdr = Buffer.alloc(8)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  return Buffer.concat([Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'), ihdr])
+}
+
+/**
+ * The start of a JPEG of that size: SOI, an APP0 and a DHT segment to skip (DHT's marker, C4, sits among the
+ * frame-header markers), then the SOF0 frame header.
+ */
+const jpegOf = (width: number, height: number) => {
+  const sof = Buffer.from('ffc0001108000000000301', 'hex')
+  sof.writeUInt16BE(height, 5)
+  sof.writeUInt16BE(width, 7)
+  const app0 = 'ffe000104a46494600010100000100010000'
+  const dht = 'ffc4000900000000000000'
+  return Buffer.concat([Buffer.from(`ffd8${app0}${dht}`, 'hex'), sof])
+}
+
+const pngBytes = pngOf(1280, 800)
 
 let outDir: string
 let qaDir: string
@@ -60,7 +115,13 @@ afterEach(async () => {
 /** Writes `c2-chat/findings/<title>.json` and, unless `spec` is null, its repro spec. */
 const writeFinding = async (finding: RawFinding, spec: string | null = validSpec(finding.title)) => {
   await Bun.write(join(outDir, 'c2-chat/findings', `${finding.title}.json`), JSON.stringify(finding))
-  if (spec !== null) await Bun.write(join(outDir, 'c2-chat', finding.repro_spec), spec)
+  if (spec !== null && finding.repro_spec) await Bun.write(join(outDir, 'c2-chat', finding.repro_spec), spec)
+}
+
+/** Writes c2-chat's transcript with the given tool calls, and the screenshot file `mcp/<shotFile>`. */
+const writeSession = async (steps: (readonly [string, string])[]) => {
+  await Bun.write(join(outDir, 'c2-chat/transcript.json'), JSON.stringify(callsOf(steps)))
+  await Bun.write(join(outDir, 'c2-chat/mcp', shotFile), pngBytes)
 }
 
 const controlSpec = () => join(qaDir, 'control/stack.spec.ts')
@@ -108,6 +169,19 @@ const droppedAt = (result: Verified, gate: Verified['dropped'][number]['gate']) 
   result.dropped.filter((entry) => entry.gate === gate)
 
 describe('replay', () => {
+  test('a probe line filed as a console error is an observation, as a layout finding it replays', async () => {
+    await Bun.write(join(qaDir, 'noise.txt'), await Bun.file(join(import.meta.dir, '../noise.txt')).text())
+    const evidence = '[ERROR] [qa-layout] covered button "Continue" @ http://localhost:1424/layout-probe.js:209'
+    await writeFinding(makeFinding('mislabeled', { type: 'console-error', evidence }))
+    await writeFinding(makeFinding('layout', { type: 'layout', evidence }))
+    const calls: string[][] = []
+
+    const result = await replay(outDir, fakeRunner({}, calls), qaDir)
+
+    expect(titles(result.observations)).toEqual(['mislabeled'])
+    expect(calls[0]).toEqual([controlSpec(), join(outDir, 'c2-chat/repro/layout.spec.ts')])
+  })
+
   test('only findings with an oracle, outside the noise list and with a clean spec reach Playwright', async () => {
     await Bun.write(join(outDir, 'c2-chat/findings/broken.json'), '{ not json')
     await writeFinding(makeFinding('no-oracle', { type: 'looks-off', evidence: 'the button seems odd' }))
@@ -187,7 +261,7 @@ describe('replay', () => {
   })
 
   test('a real-AI charter confirms at 2/3 failures and is flaky at 1/3, while other charters still need 3/3', async () => {
-    const real = 'c5-widgets-connections'
+    const real = 'c5-widgets-connections-desktop'
     for (const title of ['twice', 'once', 'never', 'always']) {
       const finding = { ...makeFinding(title, pageError), charter: real }
       await Bun.write(join(outDir, real, 'findings', `${title}.json`), JSON.stringify(finding))
@@ -320,6 +394,139 @@ describe('replay', () => {
     expect(droppedAt(result, 'replay').map((entry) => entry.reason)).toEqual(['stack unhealthy'])
   })
 
+  test('replay confirms a visual finding whose screenshot the browser tool took, without Playwright', async () => {
+    await writeFinding(makeVisual('shot'), null)
+    await writeSession([['mcp__playwright__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp`)]])
+    const calls: string[][] = []
+
+    const result = await replay(outDir, fakeRunner({}, calls), qaDir)
+
+    expect(calls).toEqual([])
+    expect(result.confirmed).toEqual([
+      {
+        charterDir: 'c2-chat',
+        id: 'shot',
+        finding: makeVisual('shot'),
+        replay: { failed: 0, runs: 0 },
+        artifacts: { screenshot: relative(process.cwd(), join(outDir, 'c2-chat/mcp', shotFile)) },
+      },
+    ])
+  })
+
+  test('a visual finding does not take a place under the replay cap', async () => {
+    for (let n = 0; n < 20; n++) await writeFinding(makeFinding(`f${String(n).padStart(2, '0')}`, pageError))
+    await writeFinding(makeVisual('shot'), null)
+    await writeSession([['mcp__playwright__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp`)]])
+
+    const result = await replay(outDir, fakeRunner({}, []), qaDir)
+
+    expect(result.deferred).toEqual([])
+    expect(titles(result.confirmed)).toEqual(['shot'])
+  })
+
+  test('replay drops a visual finding whose screenshot the session never took, or that is missing', async () => {
+    await writeFinding(makeVisual('untaken'), null)
+    await writeFinding(makeVisual('lost', 'mcp/page-lost.png'), null)
+    await writeSession([
+      // The explorer typed the file name into the page and read it back: not a screenshot.
+      ['mcp__playwright__browser_evaluate', `### Result\n"${sessionDir}/mcp/${shotFile}"`],
+      ['mcp__playwright__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp`, 'page-lost.png')],
+    ])
+
+    const result = await replay(outDir, fakeRunner({}, []), qaDir)
+
+    expect(result.confirmed).toEqual([])
+    expect(droppedAt(result, 'lint').map((entry) => [entry.file.id, entry.reason])).toEqual([
+      ['lost', 'screenshot not found'],
+      ['untaken', 'screenshot not taken by the browser tool in this session'],
+    ])
+  })
+
+  /** A Write or Edit call on `file_path`, as transcript.jq keeps it, and its result. */
+  const fileTool = (name: string, id: string, file_path: string): TranscriptMessage[] => [
+    { message: { content: [{ type: 'tool_use', id, name, input: { file_path } }] } },
+    { message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } },
+  ]
+
+  /** Writes each screenshot under c2-chat/mcp/, a visual finding named after it, and a transcript taking them all. */
+  const writeShots = async (shots: Record<string, Buffer>, extra: TranscriptMessage[] = []) => {
+    const steps = Object.keys(shots).map(
+      (name) => ['mcp__playwright__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp`, name)] as const,
+    )
+    await Bun.write(join(outDir, 'c2-chat/transcript.json'), JSON.stringify([...callsOf(steps), ...extra]))
+    for (const [name, bytes] of Object.entries(shots)) {
+      await Bun.write(join(outDir, 'c2-chat/mcp', name), bytes)
+      await writeFinding(makeVisual(name.replace(/\.\w+$/, ''), `mcp/${name}`), null)
+    }
+  }
+
+  const replayDrops = async () => {
+    const result = await replay(outDir, fakeRunner({}, []), qaDir)
+    return {
+      confirmed: titles(result.confirmed),
+      dropped: droppedAt(result, 'lint').map((entry) => [entry.file.id, entry.reason]),
+    }
+  }
+
+  test('replay drops a visual finding whose screenshot a file tool wrote after the browser', async () => {
+    await writeShots({ 'written.png': pngBytes, 'edited.png': pngBytes, 'kept.png': pngBytes }, [
+      ...fileTool('Write', 'w0', `${sessionDir}/mcp/written.png`),
+      ...fileTool('Edit', 'w1', `${sessionDir}/mcp/edited.png`),
+      ...fileTool('Write', 'w2', `${sessionDir}/findings/kept.json`),
+    ])
+
+    expect(await replayDrops()).toEqual({
+      confirmed: ['kept'],
+      dropped: [
+        ['edited', 'screenshot written by a file tool, not the browser'],
+        ['written', 'screenshot written by a file tool, not the browser'],
+      ],
+    })
+  })
+
+  test('replay drops a visual finding whose screenshot is not a PNG or a JPEG', async () => {
+    await writeShots({ 'text.png': Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'), 'kept.png': pngBytes })
+
+    expect(await replayDrops()).toEqual({
+      confirmed: ['kept'],
+      dropped: [['text', 'screenshot is not a PNG or JPEG image']],
+    })
+  })
+
+  test("replay drops a visual finding whose screenshot is over the API's 10 MB image limit", async () => {
+    // 7.5 MB of bytes is 10 MB once base64-encoded, which is how the API measures it.
+    await writeShots({ 'huge.png': Buffer.concat([pngBytes, Buffer.alloc(7_500_000)]), 'kept.png': pngBytes })
+
+    expect(await replayDrops()).toEqual({
+      confirmed: ['kept'],
+      dropped: [['huge', "screenshot over the API's 10 MB image limit"]],
+    })
+  })
+
+  test("replay drops a visual finding whose screenshot is over the API's 8000 px image limit", async () => {
+    await writeShots({ 'tall.png': pngOf(1280, 8001), 'wide.jpeg': jpegOf(8001, 600), 'kept.jpeg': jpegOf(1280, 8000) })
+
+    expect(await replayDrops()).toEqual({
+      confirmed: ['kept'],
+      dropped: [
+        ['tall', "screenshot over the API's 8000 px image limit"],
+        ['wide', "screenshot over the API's 8000 px image limit"],
+      ],
+    })
+  })
+
+  test('a screenshot counts only when a browser screenshot result of the same device names it', () => {
+    const transcript = callsOf([
+      ['mcp__playwright__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp`, 'page-a.png')],
+      ['mcp__playwright_b__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp-b`, 'page-b.png')],
+      ['mcp__playwright__browser_evaluate', `${sessionDir}/mcp/page-c.png`],
+    ])
+    expect(screenshotTaken(transcript, 'mcp/page-a.png')).toBe(true)
+    expect(screenshotTaken(transcript, 'mcp-b/page-b.png')).toBe(true)
+    expect(screenshotTaken(transcript, 'mcp/page-b.png')).toBe(false)
+    expect(screenshotTaken(transcript, 'mcp/page-c.png')).toBe(false)
+  })
+
   test('Playwright gets only the allowlisted variables, never the caller environment', () => {
     expect(Object.keys(replayEnv('qa-out')).sort()).toEqual([
       'CI',
@@ -372,9 +579,93 @@ describe('judge', () => {
   const writeCandidates = async (candidates: Verified) => {
     await Bun.write(join(outDir, 'candidates.json'), JSON.stringify(candidates))
     for (const file of [...candidates.confirmed, ...candidates.flaky]) {
-      await Bun.write(join(outDir, file.charterDir, file.finding.repro_spec), validSpec(file.finding.title))
+      const { repro_spec, screenshot, title } = file.finding
+      if (repro_spec) await Bun.write(join(outDir, file.charterDir, repro_spec), validSpec(title))
+      if (screenshot) await Bun.write(join(outDir, file.charterDir, screenshot), pngBytes)
     }
   }
+
+  const visualCandidate = (finding: RawFinding) => ({
+    charterDir: 'c2-chat',
+    id: finding.title,
+    finding,
+    replay: { failed: 0, runs: 0 },
+    artifacts: { screenshot: `qa-out/c2-chat/${finding.screenshot}` },
+  })
+
+  const recordingCreate =
+    (calls: Anthropic.MessageCreateParamsNonStreaming[]): CreateMessage =>
+    async (params) => {
+      calls.push(params)
+      return {
+        content: [{ type: 'text', text: '{"keep":true,"reason":"The button is hidden."}', citations: null }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 2000, output_tokens: 100 },
+      }
+    }
+
+  test('the judge sees a visual finding without a spec, and its screenshot typed by its bytes', async () => {
+    const png = makeVisual('png')
+    // A JPEG saved under a .png name: the bytes decide the media type, not the extension.
+    const jpeg = makeVisual('jpeg', 'mcp-b/page-1.png')
+    await writeCandidates({ confirmed: [png, jpeg].map(visualCandidate), flaky: [], observations: [], dropped: [] })
+    const jpegBytes = jpegOf(390, 844)
+    await Bun.write(join(outDir, 'c2-chat/mcp-b/page-1.png'), jpegBytes)
+    const calls: Anthropic.MessageCreateParamsNonStreaming[] = []
+
+    const result = await judge(outDir, recordingCreate(calls), qaDir)
+
+    expect(titles(result.confirmed)).toEqual(['png', 'jpeg'])
+    const image = (mediaType: 'image/png' | 'image/jpeg', bytes: Buffer): Anthropic.ImageBlockParam => ({
+      type: 'image',
+      source: { type: 'base64', media_type: mediaType, data: bytes.toString('base64') },
+    })
+    expect(calls.map((call) => call.messages[0].content)).toEqual([
+      [image('image/png', pngBytes), { type: 'text', text: `<finding>\n${JSON.stringify(png, null, 2)}\n</finding>` }],
+      [
+        image('image/jpeg', jpegBytes),
+        { type: 'text', text: `<finding>\n${JSON.stringify(jpeg, null, 2)}\n</finding>` },
+      ],
+    ])
+  })
+
+  test('the judge never reads a screenshot path that leaves the session dir', async () => {
+    // A candidates.json written by anything but replay. Both files exist, one level above the session dir.
+    await Bun.write(join(outDir, 'secret.png'), pngBytes)
+    await Bun.write(join(outDir, 'mcp/page-1.png'), pngBytes)
+    const outside = [
+      { ...visualCandidate(makeVisual('escape')), finding: makeVisual('escape', '../secret.png') },
+      { ...visualCandidate(makeVisual('root')), charterDir: '.', finding: makeVisual('root', 'mcp/page-1.png') },
+    ]
+    const calls: Anthropic.MessageCreateParamsNonStreaming[] = []
+
+    for (const candidate of outside) {
+      await Bun.write(
+        join(outDir, 'candidates.json'),
+        JSON.stringify({ confirmed: [candidate], flaky: [], observations: [], dropped: [] }),
+      )
+      await expect(judge(outDir, recordingCreate(calls), qaDir)).rejects.toThrow()
+    }
+    expect(calls).toEqual([])
+  })
+
+  test('an image counts toward the judge spend ceiling', async () => {
+    expect(worstJudgeCost('s', 'u', 1) - worstJudgeCost('s', 'u', 0)).toBeCloseTo((1_600 * 4) / 1_000_000)
+    // Text that fits under the $2 ceiling with 800 input tokens to spare, so only the image's 1,600 push it over.
+    const base = makeVisual('tight')
+    const room = (2 - (4096 * 20) / 1_000_000) / (4 / 1_000_000) - 1_000 - 26 - 800
+    const pad = room - JSON.stringify(base, null, 2).length - '<finding>\n\n</finding>'.length
+    const tight = { ...base, actual: 'x'.repeat(Math.floor(pad)) }
+    await writeCandidates({ confirmed: [visualCandidate(tight)], flaky: [], observations: [], dropped: [] })
+    const calls: Anthropic.MessageCreateParamsNonStreaming[] = []
+
+    const result = await judge(outDir, recordingCreate(calls), qaDir)
+
+    expect(calls).toEqual([])
+    expect(result.deferred).toEqual([
+      { file: visualCandidate(tight), step: 'judge', reason: "over the judge's spend ceiling of $2" },
+    ])
+  })
 
   test('keeps what the judge keeps and drops the rest, defaulting to drop on a malformed reply', async () => {
     const observation = { charterDir: 'c2-chat', id: 'obs', finding: makeFinding('obs', pageError) }

@@ -32,7 +32,7 @@ const allowedPaths = /^(src|shared|backend\/src)\//
 const sensitivePaths =
   /^(src|backend\/src)\/db\/|auth|sso|session|device|sign-?in|log-?(in|out)|otp|approv|recovery|secret|credential|crypto|encrypt|powersync|drizzle|migration/i
 /** True when `path` (repo-relative) is sensitive app code that no automated change may touch. */
-const isSensitive =(path: string) => sensitivePaths.test(path)
+const isSensitive = (path: string) => sensitivePaths.test(path)
 /** True when a fix PR must not touch `path` (repo-relative): anything outside app code, or sensitive app code. */
 export const isDenied = (path: string) => !allowedPaths.test(path) || isSensitive(path)
 
@@ -105,9 +105,10 @@ type RouteOptions = {
  * Decide in code which filed tickets the fix agent may attempt, and write `fix-plan.json`.
  * A ticket (created, regression or commented) qualifies when its finding was confirmed 3/3, its repro spec is
  * on disk, its area is fixable, and no `qa-fix/<fp>` branch exists yet (an earlier draft PR is still open).
- * At most three, highest severity first. Security findings are never routed. Every other area (sync, auth,
- * models, data, onboarding, …) needs a person, and so does every real-AI finding, because the fix job checks a fix
- * on the fake AI: with `live` those tickets get the `Human Required` label.
+ * At most three, highest severity first, and one per fingerprint however many platforms found the bug. Security
+ * and visual findings are never routed (a visual ticket is filed with `Human Required`). Every other area (sync,
+ * auth, models, data, onboarding, …) needs a person, and so does every real-AI finding, because the fix job
+ * checks a fix on the fake AI: with `live` those tickets get the `Human Required` label.
  * With `live` only tickets that exist count, so a filing forced into a dry run starts no fix agent; a dry run
  * plans what a live filing would have created.
  */
@@ -133,14 +134,19 @@ export const route = async ({
     if (!verified) continue
     const finding = findingSchema.parse(verified.finding)
     const ticket = { fp, severity, issueId, identifier, url }
-    if (finding.area === 'security') continue
+    // The filer gives a visual ticket the Human Required label itself.
+    if (finding.area === 'security' || finding.oracle.type === 'visual') continue
     if (!fixableAreas.has(finding.area) || realAiCharters.has(charterDir)) {
-      plan.humanRequired.push({ ...ticket, area: finding.area })
+      // filed.json has one line per platform, so a cross-platform ticket shows up more than once.
+      if (!plan.humanRequired.some((t) => t.fp === fp)) plan.humanRequired.push({ ...ticket, area: finding.area })
       continue
     }
+    // Only a visual finding may lack a spec; this narrows the type.
+    if (!finding.repro_spec) continue
     const spec = join(outDir, charterDir, finding.repro_spec)
     if (plan.fixes.length === maxFixes || pending.has(fp) || !(await Bun.file(spec).exists())) continue
-    // Two charters can confirm one bug (same fp) in a run; a second fix job would fight over `qa-fix/<fp>`.
+    // Two platforms or charters can confirm one bug (same fp) in a run; a second fix job would fight over
+    // `qa-fix/<fp>`.
     pending.add(fp)
     plan.fixes.push({ ...ticket, charterDir, spec, finding: ticketView(finding) })
   }
@@ -162,13 +168,15 @@ const e2eTestExports = new Set(['test', 'expect', 'Page', 'Request', 'Route'])
  * The repro spec as a permanent regression test. The name matches a Playwright project so
  * `scripts/check-e2e-specs-collected.ts` accepts it: `sync-qa-` for the two-device charter (the only one on
  * Postgres + PowerSync), `consumer-qa-` for the rest, which replay against the consumer pair. Imports move from
- * `qa-out/<charter>/repro/` to `e2e/`, and `@playwright/test` becomes `./test` like every other spec (it adds
- * WebKit's persistent profile and the attestation stub) unless the spec imports something `./test` lacks.
+ * `qa-out/<charter>/repro/` to `e2e/` (the layout helper stays in `.github/qa/`), and `@playwright/test` becomes
+ * `./test` like every other spec (it adds WebKit's persistent profile and the attestation stub) unless the spec
+ * imports something `./test` lacks.
  */
 export const regressionSpec = (charterDir: string, fp: string, source: string) => ({
   path: `e2e/${charterDir.startsWith('c7-') ? 'sync' : 'consumer'}-qa-${fp}.spec.ts`,
   source: source
     .replace(/(from\s*)(['"])\.\.\/\.\.\/\.\.\/e2e\/helpers\2/g, '$1$2./helpers$2')
+    .replace(/(from\s*)(['"])\.\.\/\.\.\/\.\.\/(\.github\/qa\/layout)\2/g, '$1$2../$3$2')
     .replace(
       /(import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*)(['"])@playwright\/test\3/g,
       (whole: string, head: string, names: string, quote: string) =>

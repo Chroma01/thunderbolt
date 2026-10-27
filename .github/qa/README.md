@@ -59,19 +59,41 @@ code from. The fallback is a checkout the job's user cannot write during replay.
 
 1. **build**: the normal, onboarding (c1) and canary builds, then the guard: a fresh stack must pass
    `control/stack.spec.ts`, or the run stops and `notify-on-failure` fires.
-2. **explore**: one leg per charter and one per free-session platform (`free-<case>-<platform>`), with
-   `claude-code-action`, the Playwright MCP (`mcp.json`, plus `mcp-two-devices.json` for c7's second browser) and the
+2. **explore**: one leg per charter and platform, named `<charter>-<platform>` (`c4-skills-projects-phone`), and one
+   per free-session platform (`free-<case>-<platform>`); `legs.ts` plans them. A canary adds its session's leg on the
+   canary build. Each runs with `claude-code-action`, the Playwright MCP (`mcp.json`, plus `mcp-two-devices.json` for c7's second browser) and the
    prompt `explore.sh prompt` builds. Attempts, findings and repro specs are written as they happen, so a cut session
-   keeps its work.
+   keeps its work. `mcp.json` loads `layout-probe.js` into every page (`--init-script`, a path relative to the repo
+   root, where the session runs). The probe writes `[qa-layout] ready` once per page load and one
+   `[qa-layout] <kind> <target>` line per layout problem, all with `console.error`, so they pass the MCP's
+   `--console-level error`. A problem line is a `layout` finding. The MCP does not put console text in a tool
+   result: a navigate result holds a count of console errors and a link to the lines the load wrote, in a log file
+   under `--output-dir` (absolute, because of `--file-paths absolute`). The explorer reads the lines with
+   `browser_console_messages`. `report.ts` follows each navigate link inside the session's own directory (the link
+   is cut at its `mcp/` or `mcp-b/` part, so another runner path still resolves) and lists a session whose page
+   loads lack the ready line under "Layout probe" (Back is not a load: it is a same-document move), because a clean layout there proves nothing. `noise.txt` turns
+   a `[qa-layout]` line filed as a `console-error` into an observation. The explorer also takes a screenshot of
+   every new screen and sees it (`--image-responses allow`). A defect it sees there and the probe did not report is
+   a `visual` finding, which names its screenshot (`mcp/<file>`) instead of a repro spec. `--output-dir` is
+   `<session>/mcp` (`mcp-b` for c7's second browser), and the job uploads its screenshots and console logs with
+   the session.
 3. **replay** (`verify.ts replay`): schema, oracle (`noise.txt`) and lint gates, then each spec 3 times. 3 of 3
    failures confirm a finding, 2 of 3 for the real-AI charters (`realAiCharters` in `findings.ts`); 1 or 2 are flaky
    (report only), 0 is dropped. c7 replays on Postgres + PowerSync, the real-AI charters against the real providers,
-   the rest on pglite with the fake AI.
-4. **judge** (`verify.ts judge`): one Opus call per confirmed finding with `judge.md` and `known-issues.md`. The
-   default answer is drop. Writes `verified.json`.
+   the rest on pglite with the fake AI. A `visual` finding skips the lint and Playwright and takes no place under
+   the replay cap. It is confirmed when its screenshot exists, a browser screenshot result in the session's
+   transcript names it, no Write or Edit call touched it, and it is a PNG or JPEG within the API's image limits
+   (10 MB base64-encoded, 8000 px per side). Otherwise it is dropped.
+4. **judge** (`verify.ts judge`): one Opus call per confirmed finding with `judge.md` and `known-issues.md`; a
+   `visual` finding is judged on its screenshot. The default answer is drop. Writes `verified.json`.
 5. **file** (`file-findings.ts`): fingerprint dedupe, severity table, ticket caps and roll-ups, secret refusal.
-   Dry run unless `--live`.
-6. **fix** (off by default, `fix.ts` and `fix.md`): at most 3 fake-AI tickets in fixable areas. The original spec
+   Dry run unless `--live`. The fingerprint ignores the platform, so findings that share one become one ticket
+   whose `**Platforms:**` line lists every platform that found the bug, and an open ticket gets one comment with
+   that line. A `visual` finding's fingerprint is its area, function and element (`<role> "<name>"`), never its
+   wording; one without an element or a function is refused. Its ticket names the element, carries `Human Required` and embeds
+   the screenshot, uploaded with the content type its bytes declare. A `security` finding uploads no screenshot and no video.
+6. **fix** (off by default, `fix.ts` and `fix.md`): at most 3 fake-AI tickets in fixable areas, one per
+   fingerprint, and never a `visual` one, which has no spec to pass. The original spec
    must pass 3 times on the patch before `publish` opens a draft PR on `qa-fix/<fp>`; otherwise the ticket gets
    `Human Required`. `preview-deploy.yml` deploys no preview for `qa-fix/*` PRs.
 7. **report** (`report.ts summary`): the job summary.
@@ -86,7 +108,7 @@ at most two that:
 
 - change app code under `src/` (tests, test helpers, docs and translations are left alone);
 - touch no sensitive path: the same list that keeps the fix agent away (`isSensitive` in `fix.ts`);
-- map to a charter in the script's one table (c2 to c6 and c8), one canary per charter, both on the same kind of AI;
+- map to a charter in the script's one table (c2 to c6), one canary per charter, both on the same kind of AI;
 - change no runtime code outside `src/` (`shared/`, `backend/`, `public/`, `index.html`, the Vite config): the reversal
   covers `src/` only, and the canary backend runs from the unpatched checkout;
 - can be reverted on the current tree with `git apply -R --check`.
@@ -96,7 +118,8 @@ restored and the canary leg is skipped as if nothing qualified, so a bad canary 
 gets an explore session with its charter on that build, so at most 2 sessions a week. A canary counts as found only when a judge-confirmed finding from its charter fails on the
 canary build and passes on the normal build. The report lists each fix (title, sha, charter, found or missed), and
 "Real bugs seen in the canary leg" lists confirmed findings that still fail on the normal build: real bugs, not
-counted. Canary findings are never filed.
+counted. A `visual` finding is judged on its screenshot and has no baseline replay, so it is neither found nor real;
+the report lists it as "Not measured". Canary findings are never filed.
 
 To calibrate by hand, run the workflow with the `canaries` input set to up to two commit SHAs. Those commits are used
 as they are, without the checks above except that each must have a charter, its reversal must apply, and both must use
@@ -109,9 +132,11 @@ skipped fix with the reason. Most often a later change touched the same lines; t
 
 ## Functions, coverage and the free session
 
-`functions.json` lists per area (c1 to c8) what must work: an id, an observable outcome, and `reload: true` when
+`functions.json` lists per area (c1 to c7) what must work on every platform: an id, an observable outcome, and `reload: true` when
 the outcome must survive a reload. A function that spans two areas has one owner. Each charter in `charters/` names
 the function ids its steps cover. Integrations are in no list; Google is covered through the fake Google below.
+The old phone-only charter c8 is gone: every charter runs on desktop and phone, and its content moved into c2, c4 and c6.
+Its `*-fit` functions were dropped because the layout probe covers screen fit.
 
 **Coverage** counts a function only when a `passed` or `failed` attempt quotes text a browser tool returned in that
 attempt's window, after a browser action, and, for a passed `reload` function, after a navigation that follows a
@@ -124,6 +149,8 @@ uses to judge the AI's answers) on every platform in `platforms.json`, with the 
 
 - `explore.sh journey` picks the case: weeks since 1970 modulo the number of cases, so every case runs once before
   any repeats. A dispatch's `journey` input forces one; `charters: free` runs only the free session.
+- A dispatch's `charters` input takes charter ids (every platform), session ids (one platform) and `free`, e.g.
+  `c4-skills-projects,c2-chat-power-user-phone,free`. Canary legs follow the same selection.
 - Add a case by appending an object with a new `id` (it shifts the rotation once). `bun run test:qa` checks it.
 - A platform is one entry (an `id` without a hyphen, a viewport, an MCP config) and one explore leg. A native
   platform also needs its driver and a new `viewport` value in the finding schema.
@@ -146,13 +173,17 @@ Everything runs from the repo root. The stack uses fixed ports (1424, 1425, 8005
 # The guard
 bunx playwright test --config .github/qa/playwright.config.ts --project control
 
-# One session. The last argument is the budget cap in USD (default 2).
-ANTHROPIC_API_KEY=… .github/qa/scripts/explore.sh run c2-chat-power-user qa-out 4
-QA_MCP_VIEWPORT=390x844 ANTHROPIC_API_KEY=… .github/qa/scripts/explore.sh run c8-phone qa-out 4
+# One session, named <charter>-<platform>; the platform sets the viewport and the MCP config. The last argument is
+# the budget cap in USD (default 2).
+ANTHROPIC_API_KEY=… .github/qa/scripts/explore.sh run c2-chat-power-user-desktop qa-out 4
+ANTHROPIC_API_KEY=… .github/qa/scripts/explore.sh run c2-chat-power-user-phone qa-out 4
 ```
 
+- **c7** needs its second browser:
+  `QA_MCP_CONFIG='.github/qa/mcp.json .github/qa/mcp-two-devices.json' … explore.sh run c7-two-devices-desktop qa-out 4`.
+
 - **The free session** runs one case on one platform per call, named `free-<case>-<platform>` (`explore.sh journey`
-  prints this week's case). It takes its viewport and MCP config from `platforms.json` and needs the real-provider
+  prints this week's case). Like every session it takes its viewport and MCP config from `platforms.json`, and it needs the real-provider
   stack below: `ANTHROPIC_API_KEY=… .github/qa/scripts/explore.sh run free-trip-planner-phone qa-out 4`.
 - **c3, c4, c5 and the free session** use real providers: start the stack with `QA_REAL_PROVIDERS=true` and
   `ANTHROPIC_API_KEY`, `TINFOIL_API_KEY`, `TINFOIL_ENCLAVE_URL`, `EXA_API_KEY` in its environment. Replay their
@@ -198,10 +229,13 @@ Serve `qa-dist-canary`, run each canary's charter into `qa-out-canary` and repla
 Collect the patch like the workflow does, then `bun .github/qa/scripts/fix.ts publish --out qa-out --fp <fp>` without `--live` shows the
 commit and the PR it would open.
 
-Every out dir must sit directly under the repo root: the specs import `../../../e2e/helpers`.
+Every out dir must sit directly under the repo root: the specs import `../../../e2e/helpers` and
+`../../../.github/qa/layout`.
 
-The scripts' tests and type check: `bun run test:qa` and `bunx tsc -p .github/qa` (the `qa` job in `ci.yml` runs
-both when a QA file changes).
+The scripts' tests and type check: `bun run test:qa` and `bunx tsc -p .github/qa`. The layout probe
+(`layout-probe.js`) has its own tests on static pages in `fixtures/layout/`:
+`bunx playwright test --config .github/qa/playwright.config.ts --project probe`. The `qa` job in `ci.yml` runs all
+three when a QA file changes.
 
 ## Fake Google
 
@@ -240,7 +274,8 @@ restarting the stack disconnects Google.
 3. Set `QA_AGENT_ENABLED=true`, leave `QA_LINEAR_ENABLED` and `QA_AUTOFIX_ENABLED` unset. From now on the
    Monday schedule runs too, still as a dry run.
 4. Run the workflow by hand from `main` with `dry_run` on (the default), first with one charter
-   (`charters: c2-chat-power-user`; separate several ids with commas or spaces), then with all of them. Read the
+   (`charters: c2-chat-power-user`, or one session such as `c2-chat-power-user-phone`; separate several ids with commas
+   or spaces), then with all of them. Read the
    job summary.
 5. Set `QA_LINEAR_ENABLED=true` to file for real. The schedule then files live; a dispatch files live only with
    `dry_run` off. A dispatch from another branch is always a dry run.
@@ -280,7 +315,8 @@ secret would be used without warning. `notify` uses the existing repository secr
 Team Thunderbolt needs these labels, or the filer stops and lists the missing ones:
 
 - `qa-agent`, `Bug`, `Security` (filing)
-- `Human Required` (tickets the fix agent must not touch)
+- `Human Required` (tickets the fix agent must not touch; filing puts it on every `visual` ticket, and the fix
+  step on the tickets it hands to a person)
 - `qa:valid`, `qa:not-a-bug`, `qa:duplicate`, `qa:env-artifact` (triage; the scorecard reads them to compute
   precision, and filing falls back to a dry run while precision stays under 70% over 8+ triaged tickets that are
   not duplicates)
@@ -301,9 +337,10 @@ workspace's spend limit bounds what a leaked key can cost, and auto-fix stays of
 Caps live in one place per step type: the `env` block at the top of `qa-weekly.yml` for explore and fix (budget,
 turns, timeout), and the constants at the top of `verify.ts` for the judge. The first values are generous on
 purpose: explore $10 / 400 turns / 60 min, fix $20 / 200 turns / 60 min. Per leg, at most 20 findings are replayed
-and 15 judged, and a judge leg spends at most $2 (a call is admitted only if its worst case fits: prompt bytes plus
-`max_tokens`, at Opus prices). Findings over a cap are listed as deferred and never filed. The app's own provider
-calls in real-AI sessions are **not measured**: watch the QA provider keys' dashboards.
+and 15 judged, and a judge leg spends at most $2 (a call is admitted only if its worst case fits: prompt bytes,
+1,600 tokens per screenshot, plus `max_tokens`, at Opus prices). Findings over a cap are listed as deferred and
+never filed. The app's own provider calls in real-AI sessions are **not measured**: watch the QA provider keys'
+dashboards.
 
 **Rule:** per step type, cap = the highest value observed (the 95th percentile once there are 20 samples) + 50%,
 for cost, turns and duration. The report's "Calibration hint" table computes it from the run's own sessions.
@@ -314,9 +351,9 @@ Measured locally on 2026-09-30 (Sonnet 5.5 explorer, Opus 5.5 judge and fix agen
 
 | Step                                                         | Sessions | Cost               | Turns   | Duration    | Stop                  |
 | ------------------------------------------------------------ | -------- | ------------------ | ------- | ----------- | --------------------- |
-| explore, fake AI (c1, c2, c4, c6, c8)                        | 12       | $0.44–1.22         | 91–227  | 2.6–6.2 min | all finished          |
+| explore, fake AI (c1, c2, c4, c6, old phone charter c8)      | 12       | $0.44–1.22         | 91–227  | 2.6–6.2 min | all finished          |
 | explore, real providers (c3, c5)                             | 4        | $0.48–1.11         | 81–134  | 3.3–7.4 min | all finished          |
-| explore, canary leg (c8, hand-written canaries)              | 2        | $0.94–1.03         | 154–162 | 4.6–4.8 min | all finished          |
+| explore, canary leg (old phone charter c8, hand-written)     | 2        | $0.94–1.03         | 154–162 | 4.6–4.8 min | all finished          |
 | judge (Opus 5.5, one call per finding, 4–5 findings per run) | 4 runs   | $0.05–0.08 per run | –       | –           | –                     |
 | fix agent (one overflow bug)                                 | 1        | $0.26              | 21      | 3.1 min     | finished, spec passes |
 
@@ -340,8 +377,8 @@ The fix agent's draft PR already does this. By hand:
 
 1. Take `qa-out/<charter>/repro/<n>.spec.ts` from the run's `qa-replay-weekly` artifact.
 2. Save it as `e2e/consumer-qa-<fp>.spec.ts` (`e2e/sync-qa-<fp>.spec.ts` for c7).
-3. Change `'../../../e2e/helpers'` to `'./helpers'`, and `@playwright/test` to `./test` when it imports only
-   `test`, `expect`, `Page`, `Request` or `Route`.
+3. Change `'../../../e2e/helpers'` to `'./helpers'`, `'../../../.github/qa/layout'` to `'../.github/qa/layout'`,
+   and `@playwright/test` to `./test` when it imports only `test`, `expect`, `Page`, `Request` or `Route`.
 4. `bun run e2e:check-collected`, then check that the spec fails before the fix and passes after it.
 
 A c1 spec runs against the onboarding build on port 1425, which the root `playwright.config.ts` does not start. It
@@ -397,8 +434,9 @@ Also:
   placeholder request in c3 was).
 - Repro specs are model-written. A spec that fails before its assertion is dropped by the judge even when the bug
   is real, which is how a hand-written skill-delete canary was missed locally (recall 2/3).
-- A security finding's ticket carries no run link, but its finding JSON and repro spec still sit in the explore
-  and replay artifacts for their 7-day retention. This repo is public, so any signed-in GitHub user can download
+- A security finding's ticket carries no run link, but its finding JSON, repro spec and screenshots still sit in
+  the explore and replay artifacts for their 7-day retention. The secret scan before the upload matches key text,
+  so it cannot see a key drawn in a screenshot. This repo is public, so any signed-in GitHub user can download
   them.
 - A scheduled run acts as the user who last edited the cron line. `claude-code-action` refuses bot actors, so
   that must be a person.

@@ -32,43 +32,78 @@ const oracleTypes = [
   'http-5xx',
   'lost-on-reload',
   'stuck',
-  'overflow',
+  'layout',
+  'visual',
   'assert-failed',
   'ai-reported-failure',
 ] as const
 
+/** The platform ids of `platforms.json`. They never contain a hyphen, so a session id ends at the last one. */
+export const platformIds = platforms.map((platform) => platform.id)
+
+/** An explore session: `<charter>-<platform>`, or `free-<case>-<platform>` for a free session. */
+export type Session = { charter: string; platform: string }
+
+/** Splits a session id at its last hyphen, and throws when what follows is not a platform id. */
+export const parseSession = (session: string): Session => {
+  const cut = session.lastIndexOf('-')
+  const platform = session.slice(cut + 1)
+  if (!platformIds.includes(platform)) throw new Error(`unknown platform in session id: ${session}`)
+  return { charter: session.slice(0, cut), platform }
+}
+
 /**
- * Charters explored with the app's real AI providers, and the free session of every case on every platform
- * (`free-<case>-<platform>`). Their findings replay on a stack with the real providers too, where two failed runs in
- * three confirm one, and they never go to the fix agent, whose check runs on the fake AI. The workflow reads this set
- * to plan its legs.
+ * Sessions explored with the app's real AI providers: three charters on every platform, and the free session of
+ * every case on every platform (`free-<case>-<platform>`). Their findings replay on a stack with the real providers
+ * too, where two failed runs in three confirm one, and they never go to the fix agent, whose check runs on the fake
+ * AI. The workflow reads this set to plan its legs.
  */
 export const realAiCharters = new Set([
-  'c3-models-providers',
-  'c4-skills-projects',
-  'c5-widgets-connections',
-  ...journeys.flatMap((journey) => platforms.map((platform) => `free-${journey.id}-${platform.id}`)),
+  ...['c3-models-providers', 'c4-skills-projects', 'c5-widgets-connections'].flatMap((charter) =>
+    platformIds.map((platform) => `${charter}-${platform}`),
+  ),
+  ...journeys.flatMap((journey) => platformIds.map((platform) => `free-${journey.id}-${platform}`)),
 ])
 
 export type Area = (typeof areas)[number]
 export type Severity = 'Urgent' | 'High' | 'Medium' | 'Low'
 
-/** A finding that passed the oracle check: a known oracle type backed by quoted evidence. */
-export const findingSchema = z.object({
+/** A browser screenshot's path inside the session dir: `mcp/<file>`, or `mcp-b/<file>` for c7's second device. */
+export const screenshotFile = z.string().regex(/^mcp(-b)?\/[\w.-]+\.(png|jpe?g)$/)
+
+const findingFields = z.object({
   title: z.string().min(1),
   area: z.enum(areas),
   charter: z.string().min(1),
-  viewport: z.enum(['desktop', 'phone']),
+  viewport: z.string().refine((id) => platformIds.includes(id), 'unknown platform'),
   oracle: z.object({ type: z.enum(oracleTypes), evidence: z.string().trim().min(1) }),
   steps: z.array(z.string()).min(1),
   expected: z.string(),
   actual: z.string(),
-  // Resolved inside qa-out/<charter>/, so it must not be able to point anywhere else.
-  repro_spec: z.string().regex(/^repro\/[\w-]+\.spec\.ts$/),
+  // Both paths are resolved inside qa-out/<charter>/, so they must not be able to point anywhere else.
+  repro_spec: z
+    .string()
+    .regex(/^repro\/[\w-]+\.spec\.ts$/)
+    .optional(),
+  screenshot: screenshotFile.optional(),
+  /** The accessible name of the element a visual finding is about, as `<role> "<name>"`. */
+  element: z.string().optional(),
+  /** The function id of the attempt that showed the finding, as in its attempt record. */
+  function: z.string().optional(),
 })
+
+/** A visual finding is proven by its screenshot, every other one by a repro spec. */
+const provable = (finding: { oracle: { type: string }; repro_spec?: string; screenshot?: string }) =>
+  finding.oracle.type === 'visual' ? finding.screenshot !== undefined : finding.repro_spec !== undefined
+const provableMessage = 'a visual finding needs a screenshot, any other finding a repro_spec'
+
+/** A finding that passed the oracle check: a known oracle type backed by quoted evidence. */
+export const findingSchema = findingFields.refine(provable, provableMessage)
 export type Finding = z.infer<typeof findingSchema>
 
-const rawFindingSchema = findingSchema.extend({ oracle: z.object({ type: z.string(), evidence: z.string() }) })
+const rawFindingSchema = findingFields
+  .extend({ oracle: z.object({ type: z.string(), evidence: z.string() }) })
+  .refine(provable, provableMessage)
 /** A finding as the explorer wrote it, before the oracle check. */
 export type RawFinding = z.infer<typeof rawFindingSchema>
 
@@ -110,9 +145,9 @@ export const hasOracle = (finding: RawFinding): finding is Finding => findingSch
 
 /**
  * Import specifiers a repro spec may use. Assumes specs are replayed where the explorer wrote them,
- * `qa-out/<charter>/repro/<n>.spec.ts`, so the repo's `e2e/helpers` is three directories up.
+ * `qa-out/<charter>/repro/<n>.spec.ts`, so the repo's `e2e/helpers` and `.github/qa/layout` are three directories up.
  */
-const allowedImports = new Set(['@playwright/test', '../../../e2e/helpers'])
+const allowedImports = new Set(['@playwright/test', '../../../e2e/helpers', '../../../.github/qa/layout'])
 
 /** Rejected wherever they appear, as a variable, a property, or a literal key, so shadowing cannot hide them. */
 const forbiddenNames = new Set([
@@ -337,10 +372,18 @@ const signature = (evidence: string) =>
     .trim()
     .slice(0, 200)
 
-/** Dedupe key for "the same bug" across runs: sha256(area|oracle type|normalized evidence), first 8 hex chars. */
+/**
+ * Dedupe key for "the same bug" across runs and platforms, first 8 hex chars of a sha256:
+ * `area|oracle type|normalized evidence`, or `area|visual|function|normalized element` for a visual finding, whose
+ * evidence is the model's own description and changes wording from one week to the next.
+ */
 export const fingerprint = (finding: RawFinding) =>
   createHash('sha256')
-    .update(`${finding.area}|${finding.oracle.type}|${signature(finding.oracle.evidence)}`)
+    .update(
+      finding.oracle.type === 'visual'
+        ? `${finding.area}|visual|${finding.function ?? ''}|${signature(finding.element ?? '')}`
+        : `${finding.area}|${finding.oracle.type}|${signature(finding.oracle.evidence)}`,
+    )
     .digest('hex')
     .slice(0, 8)
 
@@ -367,8 +410,8 @@ const areaSeverity = {
  * reaches this table: the guard's smoke spec aborts the run first.
  */
 export const severity = (finding: Finding): Severity => {
-  const { type } = finding.oracle
-  if (type === 'overflow' || type === 'console-error') return 'Low'
+  const { type, evidence } = finding.oracle
+  if (type === 'console-error' || (type === 'layout' && /\[qa-layout\] overflow-/.test(evidence))) return 'Low'
   if (type === 'lost-on-reload' || (type === 'page-error' && finding.area === 'chat')) return 'Urgent'
   // Everything else, an AI reporting that a feature failed included, is a broken feature: its area decides.
   return areaSeverity[finding.area]

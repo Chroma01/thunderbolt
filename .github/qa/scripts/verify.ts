@@ -6,17 +6,27 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
-import { rm } from 'node:fs/promises'
+import { readFile, rm } from 'node:fs/promises'
 import { join, relative, resolve } from 'node:path'
 import { parseArgs, stripVTControlCharacters } from 'node:util'
 import { z } from 'zod'
-import { hasOracle, lintReproSpec, loadFindings, realAiCharters, type FindingFile, type RejectedFile } from './findings'
+import {
+  hasOracle,
+  lintReproSpec,
+  loadFindings,
+  realAiCharters,
+  screenshotFile,
+  type FindingFile,
+  type RejectedFile,
+} from './findings'
+import type { TranscriptMessage } from './report'
 
 export type VerifiedFinding = FindingFile & {
-  /** `error`: the first failed run's error message, shown to the judge. */
+  /** `error`: the first failed run's error message, shown to the judge. A visual finding never replays: 0/0. */
   replay: { failed: number; runs: number; error?: string }
   judge?: { keep: boolean; reason: string }
-  artifacts: { video?: string; trace?: string }
+  /** Paths relative to the cwd. `screenshot`: a visual finding's screenshot. */
+  artifacts: { video?: string; trace?: string; screenshot?: string }
 }
 
 /** `qa-out/verified.json`; `candidates.json` has the same shape, with `confirmed` not yet judged. */
@@ -33,7 +43,7 @@ export type Verified = {
   /** Over a cap: never replayed (`replay`) or never judged (`judge`), so neither confirmed nor dropped. */
   deferred?: { file: FindingFile; step: 'replay' | 'judge'; reason: string }[]
   judge_usage?: { input_tokens: number; output_tokens: number; cost_usd: number }
-  /** Set when the control spec failed: nothing is confirmed and every replayed finding is dropped. */
+  /** Set when the control spec failed: every replayed finding is dropped, and only visual ones can be confirmed. */
   stack_unhealthy?: string
 }
 
@@ -68,15 +78,110 @@ const judgeCap = 15
 const judgeCeilingUsd = 2
 // Message framing and the verdict schema, on top of the prompt text.
 const judgeOverheadTokens = 1_000
+// The API scales a larger image down to about 1.15 megapixels, about 1,600 tokens.
+const judgeImageTokens = 1_600
 
 /**
  * The most a judge call can cost. A token covers at least one byte of UTF-8 text, so the prompt's byte length
- * bounds its input tokens, and `max_tokens` bounds the output.
+ * bounds its input tokens, each image adds `judgeImageTokens`, and `max_tokens` bounds the output.
  */
-const worstJudgeCost = (system: string, user: string) =>
-  ((Buffer.byteLength(system) + Buffer.byteLength(user) + judgeOverheadTokens) * judgePrice.input +
+export const worstJudgeCost = (system: string, user: string, images = 0) =>
+  ((Buffer.byteLength(system) + Buffer.byteLength(user) + judgeOverheadTokens + images * judgeImageTokens) *
+    judgePrice.input +
     judgeMaxTokens * judgePrice.output) /
   1_000_000
+
+const screenshotTools = new Set([
+  'mcp__playwright__browser_take_screenshot',
+  'mcp__playwright_b__browser_take_screenshot',
+])
+
+/**
+ * Whether a browser screenshot result in the session's transcript names `file`, a finding's `screenshot`
+ * (`mcp/<name>` or `mcp-b/<name>`). The MCP prints the absolute path of the file it saved, so the directory part
+ * also ties the file to the device that took it.
+ */
+export const screenshotTaken = (transcript: TranscriptMessage[], file: string): boolean => {
+  const blocks = transcript.flatMap((m) => m.message.content)
+  const shots = new Set(blocks.flatMap((b) => (b.type === 'tool_use' && screenshotTools.has(b.name) ? [b.id] : [])))
+  return blocks.some((b) => b.type === 'tool_result' && shots.has(b.tool_use_id) && b.content.includes(file))
+}
+
+const fileTools = new Set(['Write', 'Edit'])
+
+/** Whether the explorer's own Write or Edit tool wrote `file`: the browser's screenshot may then be gone. */
+const fileToolWrote = (transcript: TranscriptMessage[], file: string) =>
+  transcript
+    .flatMap((m) => m.message.content)
+    .some(
+      (b) =>
+        b.type === 'tool_use' &&
+        fileTools.has(b.name) &&
+        b.input?.file_path !== undefined &&
+        resolve(b.input.file_path).endsWith(`/${file}`),
+    )
+
+// The Claude API's image limits (https://platform.claude.com/docs/en/build-with-claude/vision): the size once
+// base64-encoded and the pixels per side. Over either, the judge call fails with a 400. The 5 MB limit people
+// remember is Bedrock's and Google Cloud's; the judge calls the Claude API directly.
+const imageLimit = { base64Bytes: 10_000_000, side: 8_000 }
+
+type ImageInfo = { mediaType: 'image/png' | 'image/jpeg'; width: number; height: number }
+
+const pngSignature = Buffer.from('89504e470d0a1a0a', 'hex')
+
+/** The size in a JPEG's first frame header: an SOFn marker, C0 to CF except DHT (C4), JPG (C8) and DAC (CC). */
+const jpegSize = (bytes: Buffer) => {
+  for (let at = 2; at + 9 <= bytes.length; at += 2 + bytes.readUInt16BE(at + 2)) {
+    if (bytes[at] !== 0xff) return undefined
+    const marker = bytes[at + 1]
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return { height: bytes.readUInt16BE(at + 5), width: bytes.readUInt16BE(at + 7) }
+    }
+  }
+  return undefined
+}
+
+/** The media type and size an image's own bytes declare, whatever its name says; undefined unless PNG or JPEG. */
+export const imageInfo = (bytes: Buffer): ImageInfo | undefined => {
+  if (bytes.length >= 24 && bytes.subarray(0, 8).equals(pngSignature)) {
+    return { mediaType: 'image/png', width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
+  }
+  const jpeg = bytes[0] === 0xff && bytes[1] === 0xd8 ? jpegSize(bytes) : undefined
+  return jpeg && { mediaType: 'image/jpeg', ...jpeg }
+}
+
+/**
+ * A visual finding's screenshot under `outDir`. The charter dir and the model-written path are checked on every
+ * read: no finding, and no edited candidates or verified file, can make replay, the judge or filing read a file
+ * outside the session dir.
+ */
+export const screenshotPath = (outDir: string, file: FindingFile) => {
+  if (!/^[\w-]+$/.test(file.charterDir)) throw new Error(`not a session dir: ${file.charterDir}`)
+  return join(outDir, file.charterDir, screenshotFile.parse(file.finding.screenshot))
+}
+
+/**
+ * Why a visual finding's screenshot does not prove it, or undefined when it does. The file must be one the browser
+ * wrote, and one the judge can send: a PNG or JPEG within the API's limits.
+ */
+const screenshotProblem = async (outDir: string, file: FindingFile) => {
+  const path = screenshotPath(outDir, file)
+  const screenshot = relative(join(outDir, file.charterDir), path)
+  if (!(await Bun.file(path).exists())) return 'screenshot not found'
+  // A session cut short can leave no transcript, or a broken one: nothing then proves the screenshot.
+  const transcript: TranscriptMessage[] = await Bun.file(join(outDir, file.charterDir, 'transcript.json'))
+    .json()
+    .catch(() => [])
+  if (!screenshotTaken(transcript, screenshot)) return 'screenshot not taken by the browser tool in this session'
+  if (fileToolWrote(transcript, screenshot)) return 'screenshot written by a file tool, not the browser'
+  const bytes = await readFile(path)
+  const image = imageInfo(bytes)
+  if (!image) return 'screenshot is not a PNG or JPEG image'
+  if (Math.ceil(bytes.length / 3) * 4 > imageLimit.base64Bytes) return "screenshot over the API's 10 MB image limit"
+  if (Math.max(image.width, image.height) > imageLimit.side) return "screenshot over the API's 8000 px image limit"
+  return undefined
+}
 
 /**
  * The specs are untrusted, so Playwright gets only what it needs to run and never the caller's secrets:
@@ -174,11 +279,13 @@ const loadErrors = async (specs: string[], outDir: string, runReplay: RunReplay)
  * up to `replayCap` findings (the rest are `deferred`).
  * A spec asserts the expected behaviour, so failed 3/3 = confirmed, 1–2 = flaky, 0 = dropped. A real-AI charter's
  * findings replay against the real providers, so 2/3 confirms them and only 1/3 is flaky. The same run replays
- * `.github/qa/control/stack.spec.ts`; if any of its runs fails, the stack is broken, nothing is confirmed and
- * `stack_unhealthy` says why. A spec that fails to load stops the whole Playwright run, so such specs are dropped at
- * gate `lint` and the rest replay again without them. Writes and returns `<outDir>/candidates.json`. Needs NO
- * secrets and must run without any: the specs were written by a model that read untrusted pages, and the spec lint
- * is defence in depth, not the boundary.
+ * `.github/qa/control/stack.spec.ts`; if any of its runs fails, the stack is broken, no replayed finding is confirmed
+ * and `stack_unhealthy` says why. A spec that fails to load stops the whole Playwright run, so such specs are dropped
+ * at gate `lint` and the rest replay again without them. A `visual` finding has no spec and takes no place under the
+ * cap: it is confirmed when `screenshotProblem` finds nothing wrong with its screenshot, and dropped at gate `lint`
+ * otherwise, whatever the stack's health. Writes and returns `<outDir>/candidates.json`.
+ * Needs NO secrets and must run without any: the specs were written by a model that read untrusted pages, and the
+ * spec lint is defence in depth, not the boundary.
  */
 export const replay = async (outDir: string, runReplay: RunReplay = runPlaywright, qaDir = '.github/qa') => {
   const { valid, rejected } = await loadFindings(outDir)
@@ -195,6 +302,15 @@ export const replay = async (outDir: string, runReplay: RunReplay = runPlaywrigh
     const isNoise = oracle.type === 'console-error' && noise.some((line) => oracle.evidence.includes(line))
     if (!hasOracle(file.finding) || isNoise) {
       result.observations.push(file)
+      continue
+    }
+    if (oracle.type === 'visual') {
+      const reason = await screenshotProblem(outDir, file)
+      if (reason) result.dropped.push({ file, gate: 'lint', reason })
+      else {
+        const screenshot = relative(process.cwd(), screenshotPath(outDir, file))
+        result.confirmed.push({ ...file, replay: { failed: 0, runs: 0 }, artifacts: { screenshot } })
+      }
       continue
     }
     const spec = Bun.file(join(outDir, specPath(file)))
@@ -252,24 +368,39 @@ const readVerdict = (response: Awaited<ReturnType<CreateMessage>>) => {
 
 const createMessage: CreateMessage = (params) => new Anthropic().messages.create(params)
 
+type Prompt = { candidate: VerifiedFinding; content: Anthropic.MessageParam['content']; cost: number }
+
 /**
  * Verify step 2: one fresh model call per confirmed candidate, seeing only the finding (with its oracle evidence),
- * its spec, its replay failure and `.github/qa/known-issues.md`. Kept → `confirmed`, otherwise `dropped` at gate
- * `judge`; flaky candidates are never judged. At most `judgeCap` calls, admitted in order only while their worst-case
- * cost fits under `judgeCeilingUsd`; the rest are `deferred`. Writes and returns `<outDir>/verified.json`. Needs
- * `ANTHROPIC_API_KEY` and nothing else.
+ * its spec and its replay failure (a `visual` finding's screenshot instead), and `.github/qa/known-issues.md`.
+ * Kept → `confirmed`, otherwise `dropped` at gate `judge`; flaky candidates are never judged. At most `judgeCap`
+ * calls, admitted in order only while their worst-case cost fits under `judgeCeilingUsd`; the rest are `deferred`.
+ * Writes and returns `<outDir>/verified.json`. Needs `ANTHROPIC_API_KEY` and nothing else.
  */
 export const judge = async (outDir: string, create: CreateMessage = createMessage, qaDir = '.github/qa') => {
   const candidates: Verified = await Bun.file(join(outDir, 'candidates.json')).json()
   const system = `${await Bun.file(join(qaDir, 'judge.md')).text()}\n\n${await Bun.file(join(qaDir, 'known-issues.md')).text()}`
   const prompts = await Promise.all(
-    candidates.confirmed.map(async (candidate) => {
+    candidates.confirmed.map(async (candidate): Promise<Prompt> => {
+      const finding = `<finding>\n${JSON.stringify(candidate.finding, null, 2)}\n</finding>`
+      if (candidate.finding.oracle.type === 'visual') {
+        const path = screenshotPath(outDir, candidate)
+        const bytes = await readFile(path)
+        // Replay already dropped anything else, so this only fails on a screenshot changed after replay.
+        const mediaType = imageInfo(bytes)?.mediaType
+        if (!mediaType) throw new Error(`not a PNG or JPEG image: ${path}`)
+        const image: Anthropic.ImageBlockParam = {
+          type: 'image',
+          source: { type: 'base64', media_type: mediaType, data: bytes.toString('base64') },
+        }
+        const content = [image, { type: 'text' as const, text: finding }]
+        return { candidate, content, cost: worstJudgeCost(system, finding, 1) }
+      }
       const spec = await Bun.file(join(outDir, specPath(candidate))).text()
       const user =
-        `<finding>\n${JSON.stringify(candidate.finding, null, 2)}\n</finding>\n\n` +
-        `<repro_spec>\n${spec}\n</repro_spec>\n\n` +
+        `${finding}\n\n<repro_spec>\n${spec}\n</repro_spec>\n\n` +
         `<replay_failure>\n${candidate.replay.error ?? '(no message recorded)'}\n</replay_failure>`
-      return { candidate, user, cost: worstJudgeCost(system, user) }
+      return { candidate, content: user, cost: worstJudgeCost(system, user) }
     }),
   )
   const toJudge: typeof prompts = []
@@ -288,13 +419,13 @@ export const judge = async (outDir: string, create: CreateMessage = createMessag
     }
   }
   const judged = await Promise.all(
-    toJudge.map(async ({ candidate, user }) => {
+    toJudge.map(async ({ candidate, content }) => {
       const response = await create({
         model: judgeModel,
         max_tokens: judgeMaxTokens,
         system,
         output_config: { effort: 'medium', format: zodOutputFormat(verdictSchema) },
-        messages: [{ role: 'user', content: user }],
+        messages: [{ role: 'user', content }],
       })
       return { finding: { ...candidate, judge: readVerdict(response) }, usage: response.usage }
     }),
@@ -337,7 +468,7 @@ if (import.meta.main) {
       `deferred ${result.deferred?.length ?? 0}`,
   )
   if (result.stack_unhealthy) {
-    console.error(`Stack unhealthy, nothing confirmed. The ${result.stack_unhealthy}`)
+    console.error(`Stack unhealthy, no replayed finding confirmed. The ${result.stack_unhealthy}`)
     process.exitCode = 1
   }
 }

@@ -5,12 +5,13 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { z } from 'zod'
 import type { Canary } from './canaries'
 import { type Filed, sanitize, type Scorecard } from './file-findings'
-import { type FindingFile, loadFindings, realAiCharters } from './findings'
+import { type FindingFile, loadFindings, parseSession, realAiCharters } from './findings'
+import { selects } from './legs'
 import type { Verified, VerifiedFinding } from './verify'
 
 type Stop = 'done' | 'max_budget' | 'max_turns' | 'timeout' | 'error'
@@ -94,6 +95,8 @@ type CanaryResult = {
   results: (Canary & { found: boolean })[]
   /** Confirmed findings not proven canary-caused (still failing on the normal build): real bugs, never counted. */
   real: string[]
+  /** Visual findings: confirmed from a screenshot with no baseline replay, so neither found nor real. */
+  unmeasured: string[]
 }
 
 const findingId = (f: Pick<FindingFile, 'charterDir' | 'id'>) => `${f.charterDir}/${f.id}`
@@ -102,7 +105,7 @@ const findingId = (f: Pick<FindingFile, 'charterDir' | 'id'>) => `${f.charterDir
  * A canary is found when a judge-confirmed canary-leg finding from the canary's charter replays on the normal build
  * without failing, so the reverted fixes caused it. Area, oracle type and wording are not compared: the explorer
  * files the same bug under different ones. A finding the baseline never ran, or ran on an unhealthy stack, is not
- * proven canary-caused and counts as real.
+ * proven canary-caused and counts as real. A visual finding has no replay to check, so it counts as neither.
  */
 export const matchCanaries = (canaries: Canary[], findings: VerifiedFinding[], baseline: Verified): CanaryResult => {
   const caused = (f: VerifiedFinding) =>
@@ -115,12 +118,14 @@ export const matchCanaries = (canaries: Canary[], findings: VerifiedFinding[], b
         file.replay.runs > 0 &&
         file.replay.failed === 0,
     )
+  const isVisual = (f: VerifiedFinding) => f.finding.oracle.type === 'visual'
   const results = canaries.map((c) => ({ ...c, found: findings.some((f) => f.charterDir === c.charter && caused(f)) }))
   return {
     found: results.filter((r) => r.found).length,
     total: results.length,
     results,
-    real: findings.filter((f) => !caused(f)).map(findingId),
+    real: findings.filter((f) => !isVisual(f) && !caused(f)).map(findingId),
+    unmeasured: findings.filter(isVisual).map(findingId),
   }
 }
 
@@ -163,6 +168,7 @@ const toSteps = (transcript: TranscriptMessage[]): Step[] => {
 
 /** `click` for `mcp__playwright__browser_click` (and device B's `mcp__playwright_b__…`); undefined for other tools. */
 const browserTool = (tool: string) => /^mcp__playwright(?:_b)?__browser_(\w+)$/.exec(tool)?.[1]
+const readyLine = '[qa-layout] ready'
 const readOnlyTools = new Set([
   'snapshot',
   'console_messages',
@@ -176,6 +182,49 @@ const readOnlyTools = new Set([
 const isAction = (step: Step) => {
   const tool = step.kind === 'call' ? browserTool(step.tool) : undefined
   return tool !== undefined && !readOnlyTools.has(tool)
+}
+/** The lines the MCP says a result added to its console log: `- New console entries: <path>#L<from>[-L<to>]`. */
+const consoleLink = /^- New console entries: (.+)#L(\d+)(?:-L(\d+))?$/m
+
+const readConsoleLog = (path: string) => readFile(resolve(path), 'utf8').catch(() => undefined)
+
+/**
+ * Where a console link points inside this session's directory. The explore runner wrote the link, absolute under
+ * `--file-paths absolute` or relative to its cwd, so everything before the `mcp/` or `mcp-b/` part is replaced.
+ */
+const sessionLogPath = (link: string, sessionDir: string) => {
+  const [, rest] = /^(?:.*\/)?(mcp(?:-b)?\/.+)$/.exec(link) ?? []
+  return rest ? join(sessionDir, rest) : link
+}
+
+/** The load's result links console lines that hold the probe's ready line. */
+const probeRan = async (result: string, sessionDir: string, readLog: (path: string) => Promise<string | undefined>) => {
+  const [, link, from, to = from] = consoleLink.exec(result) ?? []
+  const log = link ? await readLog(sessionLogPath(link, sessionDir)) : undefined
+  return (
+    log
+      ?.split('\n')
+      .slice(Number(from) - 1, Number(to))
+      .some((line) => line.includes(readyLine)) ?? false
+  )
+}
+
+/**
+ * Page loads in a session and how many of them did not show `[qa-layout] ready`. Back is not a load: it is a
+ * same-document history move in this SPA, and the probe runs on document loads only. The MCP puts no console text in a
+ * navigate result, only a count and a link to the log lines the load wrote, so each link is followed (`readLog`)
+ * under `sessionDir`. A load with no link, or whose linked lines lack the ready line, counts as missing.
+ */
+export const probeGaps = async (
+  transcript: TranscriptMessage[],
+  sessionDir: string,
+  readLog = readConsoleLog,
+): Promise<{ loads: number; missing: number }> => {
+  const loads = toSteps(transcript).flatMap((step) =>
+    step.kind === 'result' && browserTool(step.tool) === 'navigate' ? [step.text] : [],
+  )
+  const ran = await Promise.all(loads.map((result) => probeRan(result, sessionDir, readLog)))
+  return { loads: loads.length, missing: ran.filter((ok) => !ok).length }
 }
 const isNavigation = (step: Step) =>
   step.kind === 'call' && ['navigate', 'navigate_back'].includes(browserTool(step.tool) ?? '')
@@ -289,6 +338,8 @@ type ReportInput = {
   filed?: Filed[]
   scorecard?: Scorecard
   canary?: CanaryResult
+  /** Sessions with page loads that lacked the layout probe, by session id. */
+  probe?: Map<string, { loads: number; missing: number }>
 }
 
 const stopLabel = {
@@ -306,6 +357,19 @@ const tokens = (s: Session) =>
 const escapeCell = (text: string) => text.replaceAll('|', '\\|').replaceAll('\n', ' ')
 /** Model-written text for the public job summary: one line, no foreign links or images, capped. */
 const safe = (text: string, max: number) => sanitize(escapeCell(text), max)
+
+/** Sessions whose pages loaded without the layout probe, so a clean layout there proves nothing. */
+const probeSection = (probe: ReportInput['probe'] = new Map()) =>
+  probe.size === 0
+    ? []
+    : [
+        '',
+        '## Layout probe',
+        ...[...probe].map(
+          ([charter, { loads, missing }]) =>
+            `- **${charter}**: layout probe missing on ${missing} of ${loads} page loads`,
+        ),
+      ]
 
 /** Free sessions record their metrics as `free-<case>-<platform>`: they play a case and have no function list. */
 const isFree = (charter: string) => charter.startsWith('free-')
@@ -418,8 +482,10 @@ const gateYield = (found: number, verified: Verified, filed?: Filed[]) => {
   const afterOracle = found - verified.observations.length - dropped('schema')
   const afterLint = afterOracle - dropped('lint')
   const afterReplay = afterLint - deferred('replay') - dropped('replay')
-  // Flaky findings are never judged, and a regression is a new ticket too.
-  const filedCount = filed?.filter((a) => ['created', 'regression'].includes(a.would ?? a.action)).length
+  // Flaky findings are never judged, and a regression is a new ticket too. A fingerprint is one ticket, however many
+  // findings (one per platform) share it.
+  const tickets = filed?.filter((a) => ['created', 'regression'].includes(a.would ?? a.action))
+  const filedCount = tickets && new Set(tickets.map((a) => a.fp)).size
   return [
     `found ${found} → oracle ${afterOracle} → lint ${afterLint} → replay ${afterReplay} ` +
       `(${verified.flaky.length} flaky, ${deferred('replay')} deferred) → judge ${verified.confirmed.length} ` +
@@ -522,6 +588,7 @@ export const renderReport = (input: ReportInput) => {
     'A function counts only when a passed or failed attempt quotes a browser tool result seen after its action, ' +
       'and after a reload where the function needs one.',
     ...chartered.map((s) => coverageLine(s.charter, coverage.get(s.charter))),
+    ...probeSection(input.probe),
     ...findingsSection(
       findingsOf(input, (charterDir) => !isFree(charterDir)),
       '',
@@ -539,6 +606,9 @@ export const renderReport = (input: ReportInput) => {
         (r) => `- ${r.found ? 'found' : '**MISSED**'} ${safe(r.title, 150)} (${r.sha.slice(0, 9)}, ${r.charter})`,
       ),
       `Real bugs seen in the canary leg (not counted): ${canary.real.join(', ') || 'none'}`,
+      ...(canary.unmeasured.length > 0
+        ? [`Not measured (visual findings have no baseline replay): ${canary.unmeasured.join(', ')}`]
+        : []),
     )
   }
   const rows = calibrationRows(explore, fixes, verified?.judge_usage?.cost_usd)
@@ -590,17 +660,24 @@ export const runSummary = async (
   const lists: Record<string, QaFunction[]> = await Bun.file(join(qaDir, 'functions.json')).json()
   const functions = new Map(Object.entries(lists))
   const coverage = new Map<string, Coverage>()
+  const probe = new Map<string, { loads: number; missing: number }>()
   for (const s of sessions) {
     const dir = join(outDir, s.charter)
     const attempts = await loadAttempts(dir)
     // A free session has no list: each name it gave its own attempts counts as one function.
     const tried = new Set(attempts.flatMap((f) => (f.attempt ? [f.attempt.function] : [])))
-    const list = isFree(s.charter) ? [...tried].map((id) => ({ id, outcome: 'tried' })) : functions.get(s.charter)
-    if (list) {
-      // A save step cut short can leave a broken file: that session has no transcript.
-      const transcript = await readJson<TranscriptMessage[]>(join(dir, 'transcript.json')).catch(() => undefined)
-      coverage.set(s.charter, checkCoverage(list, attempts, transcript))
-    }
+    const list = isFree(s.charter)
+      ? [...tried].map((id) => ({ id, outcome: 'tried' }))
+      : isFix(s)
+        ? undefined
+        : functions.get(parseSession(s.charter).charter)
+    // A save step cut short can leave a broken file: that session has no transcript.
+    const transcript = isFix(s)
+      ? undefined
+      : await readJson<TranscriptMessage[]>(join(dir, 'transcript.json')).catch(() => undefined)
+    const gaps = transcript && (await probeGaps(transcript, dir))
+    if (gaps && gaps.missing > 0) probe.set(s.charter, gaps)
+    if (list) coverage.set(s.charter, checkCoverage(list, attempts, transcript))
   }
   const { valid, rejected } = await loadFindings(outDir)
   const report = renderReport({
@@ -611,6 +688,7 @@ export const runSummary = async (
     filed: await readJson<Filed[]>(join(outDir, 'filed.json')),
     scorecard: await readJson<Scorecard>(join(outDir, 'scorecard.json')),
     canary: await readJson<CanaryResult>(join(outDir, 'canary.json')),
+    probe,
   })
   await writeFile(join(outDir, 'report.md'), report)
   if (stepSummary) await appendFile(stepSummary, report)
@@ -621,14 +699,15 @@ export const runSummary = async (
  * Canary leg: match its confirmed findings against the canaries `canaries.ts` picked and the baseline (the
  * same findings replayed on the normal build, its `candidates.json`), and write `canary.json`. The filer never sees
  * the canary leg: the file job downloads only the weekly leg's `verified.json`. A dispatch's `charters` list runs only
- * some canary legs; the canaries of the others never ran, so they are left out rather than counted as missed.
+ * some canary legs, chosen as `planLegs` chooses them; the canaries of the others never ran, so they are left out
+ * rather than counted as missed.
  */
 export const runCanary = async (outDir: string, baselineDir: string, canariesPath: string, chartersInput = '') => {
   const verified: Verified = await Bun.file(join(outDir, 'verified.json')).json()
   const baseline: Verified = await Bun.file(join(baselineDir, 'candidates.json')).json()
   const picked: Canary[] = await Bun.file(canariesPath).json()
   const ran = chartersInput.split(/[ ,]+/).filter(Boolean)
-  const canaries = ran.length === 0 ? picked : picked.filter((c) => ran.includes(c.charter))
+  const canaries = picked.filter((c) => selects(ran, c.charter))
   const result = matchCanaries(canaries, verified.confirmed, baseline)
   await writeFile(join(outDir, 'canary.json'), JSON.stringify(result, null, 2))
   return result

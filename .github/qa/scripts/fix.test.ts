@@ -213,7 +213,7 @@ describe('route', () => {
   })
 
   test('a real-AI finding goes to a person even in a fixable area: the fix check runs on the fake AI', async () => {
-    const charterDir = 'c5-widgets-connections'
+    const charterDir = 'c5-widgets-connections-desktop'
     const filed: Filed[] = [{ fp: 'fp-real', charterDir, id: '1', severity: 'High', action: 'created' }]
     const confirmed: VerifiedFinding[] = [
       { charterDir, id: '1', finding: finding('chat'), replay: { failed: 2, runs: 3 }, artifacts: {} },
@@ -229,26 +229,74 @@ describe('route', () => {
     expect(plan.humanRequired.map((t) => [t.fp, t.area])).toEqual([['fp-real', 'chat']])
   })
 
-  test('routes one fix when two findings of a run share a fingerprint', async () => {
+  test('routes one fix and labels one ticket once when the same bugs were filed on desktop and phone', async () => {
+    const ticket = { fp: 'fp-same', severity: 'High', action: 'created', issueId: 'i1', identifier: 'THB-1' } as const
+    const sync = { fp: 'fp-sync', severity: 'High', action: 'created', issueId: 'i2', identifier: 'THB-2' } as const
     const filed: Filed[] = [
-      { fp: 'fp-same', charterDir: 'c2-chat-power-user', id: '1', severity: 'High', action: 'created' },
-      { fp: 'fp-same', charterDir: 'c6-settings-data', id: '1', severity: 'High', action: 'commented' },
+      { ...ticket, charterDir: 'c2-chat-power-user-desktop', id: '1' },
+      { ...ticket, charterDir: 'c2-chat-power-user-phone', id: '1' },
+      { ...sync, charterDir: 'c2-chat-power-user-desktop', id: '2' },
+      { ...sync, charterDir: 'c2-chat-power-user-phone', id: '2' },
     ]
-    const confirmed: VerifiedFinding[] = filed.map(({ charterDir }) => ({
+    const confirmed: VerifiedFinding[] = filed.map(({ charterDir, id }) => ({
       charterDir,
-      id: '1',
-      finding: finding('chat'),
+      id,
+      finding: finding(id === '1' ? 'chat' : 'sync', { repro_spec: `repro/${id}.spec.ts` }),
       replay: { failed: 3, runs: 3 },
       artifacts: {},
     }))
     const verified: Verified = { confirmed, flaky: [], observations: [], dropped: [] }
     await put(join(outDir, 'filed.json'), JSON.stringify(filed))
     await put(join(outDir, 'verified.json'), JSON.stringify(verified))
-    for (const { charterDir } of filed) await put(join(outDir, charterDir, 'repro', '1.spec.ts'), spec)
+    for (const { charterDir, id } of filed) await put(join(outDir, charterDir, 'repro', `${id}.spec.ts`), spec)
+    const calls: Call[] = []
+
+    const plan = await route({
+      outDir,
+      live: true,
+      key: 'k',
+      run: fakeRun([]),
+      fetchFn: fakeLinear(calls),
+      log: () => {},
+    })
+
+    expect(plan.fixes.map((t) => [t.fp, t.charterDir])).toEqual([['fp-same', 'c2-chat-power-user-desktop']])
+    expect(plan.humanRequired.map((t) => t.fp)).toEqual(['fp-sync'])
+    expect(calls.map((c) => c.op)).toEqual(['Label', 'AddLabel'])
+    expect(calls[1].variables.id).toBe('i2')
+  })
+
+  test('a visual ticket becomes no fix and no Human Required entry: it is filed with that label', async () => {
+    const visual = (area: Area, extra: Partial<RawFinding>) =>
+      finding(area, {
+        oracle: { type: 'visual', evidence: 'Continue sits under the banner' },
+        screenshot: 'mcp/page-1.png',
+        element: 'button "Continue"',
+        ...extra,
+      })
+    const filed: Filed[] = [
+      { fp: 'fp-layout', charterDir: 'c2-chat-desktop', id: '1', severity: 'Low', action: 'created' },
+      { fp: 'fp-onboarding', charterDir: 'c2-chat-desktop', id: '2', severity: 'High', action: 'created' },
+    ]
+    // The layout one even has a spec on disk, so only its oracle type keeps it from the fix agent.
+    const confirmed: VerifiedFinding[] = [
+      { id: '1', finding: visual('layout', { repro_spec: 'repro/1.spec.ts' }) },
+      { id: '2', finding: visual('onboarding', { repro_spec: undefined }) },
+    ].map(({ id, finding }) => ({
+      charterDir: 'c2-chat-desktop',
+      id,
+      finding,
+      replay: { failed: 0, runs: 0 },
+      artifacts: {},
+    }))
+    const verified: Verified = { confirmed, flaky: [], observations: [], dropped: [] }
+    await put(join(outDir, 'filed.json'), JSON.stringify(filed))
+    await put(join(outDir, 'verified.json'), JSON.stringify(verified))
+    await put(join(outDir, 'c2-chat-desktop', 'repro', '1.spec.ts'), spec)
 
     const plan = await route({ outDir, live: false, run: fakeRun([]), log: () => {} })
 
-    expect(plan.fixes.map((t) => [t.fp, t.charterDir])).toEqual([['fp-same', 'c2-chat-power-user']])
+    expect(plan).toEqual({ fixes: [], humanRequired: [] })
   })
 
   test('refuses a live run without a Linear key', async () => {
@@ -319,6 +367,13 @@ describe('regressionSpec', () => {
     expect(source).toContain("import { loginViaEmailCode } from './helpers'")
     expect(source).not.toContain('../../../e2e')
     expect(source.split('\n').slice(2)).toEqual(spec.split('\n').slice(2))
+  })
+
+  test('moves the layout helper import from qa-out/ to e2e/', () => {
+    const source = `import { layoutProblems } from '../../../.github/qa/layout'\n`
+    expect(regressionSpec('c8-phone', 'ab12cd34', source).source).toBe(
+      `import { layoutProblems } from '../.github/qa/layout'\n`,
+    )
   })
 
   test('uses the sync prefix for the two-device charter', () => {

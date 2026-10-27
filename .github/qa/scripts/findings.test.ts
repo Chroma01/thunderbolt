@@ -13,6 +13,8 @@ import {
   hasOracle,
   lintReproSpec,
   loadFindings,
+  parseSession,
+  platformIds,
   type RawFinding,
   realAiCharters,
   severity,
@@ -255,7 +257,7 @@ describe('severity', () => {
     ['models', 'page-error', 'High'],
     ['skills', 'page-error', 'Medium'],
     ['data', 'assert-failed', 'Medium'],
-    ['chat', 'overflow', 'Low'],
+    ['chat', 'layout', 'High'],
     ['auth', 'console-error', 'Low'],
     ['i18n', 'assert-failed', 'Low'],
     ['chat', 'ai-reported-failure', 'High'],
@@ -266,16 +268,116 @@ describe('severity', () => {
   })
 })
 
+describe('layout oracle', () => {
+  const layoutFinding = (area: Finding['area'], evidence: string): Finding => ({
+    ...finding,
+    area,
+    oracle: { type: 'layout', evidence },
+  })
+
+  test('an overflow is Low, a covered control takes its area severity', () => {
+    expect(severity(layoutFinding('onboarding', '[qa-layout] overflow-text span "Long name"'))).toBe('Low')
+    expect(severity(layoutFinding('onboarding', '[qa-layout] overflow-page body ""'))).toBe('Low')
+    // The model may quote the line the way browser_console_messages prints it.
+    const printed = '[ERROR] [qa-layout] overflow-text span "Long name" @ http://localhost:1424/x.js:209'
+    expect(severity(layoutFinding('onboarding', printed))).toBe('Low')
+    expect(severity(layoutFinding('onboarding', '[qa-layout] covered button "Continue"'))).toBe('High')
+    expect(severity(layoutFinding('skills', '[qa-layout] offscreen button "Save"'))).toBe('Medium')
+  })
+
+  test('overflow is no longer an oracle', () => {
+    expect(hasOracle(variant({ oracle: { type: 'overflow', evidence: 'x' } }))).toBe(false)
+    expect(hasOracle(variant({ oracle: { type: 'layout', evidence: '[qa-layout] covered button "Go"' } }))).toBe(true)
+  })
+
+  test('a repro spec may import the layout helper', () => {
+    const body = `
+  await loginViaEmailCode(page)
+  expect(await layoutProblems(page)).toEqual([])`
+    const withHelper = spec(body).replace(
+      '\n\ntest(',
+      "\nimport { layoutProblems } from '../../../.github/qa/layout'\n\ntest(",
+    )
+    expect(withHelper).toContain('.github/qa/layout')
+    expect(lintReproSpec(withHelper)).toEqual([])
+  })
+})
+
+describe('visual oracle', () => {
+  /** A visual finding: a screenshot the explorer took instead of a repro spec. */
+  const visual = (fields: Partial<RawFinding>): RawFinding => ({
+    ...finding,
+    area: 'layout',
+    oracle: { type: 'visual', evidence: 'The Continue button sits under the cookie banner' },
+    element: 'button "Continue"',
+    function: 'onboarding-name',
+    screenshot: 'mcp/page-1.png',
+    repro_spec: undefined,
+    ...fields,
+  })
+
+  test('a visual finding needs a screenshot and no spec', () => {
+    expect(findingSchema.safeParse(visual({ screenshot: 'mcp/page-1.png', repro_spec: undefined })).success).toBe(true)
+    expect(findingSchema.safeParse(visual({ screenshot: undefined })).success).toBe(false)
+    expect(findingSchema.safeParse({ ...finding, repro_spec: undefined }).success).toBe(false)
+  })
+
+  test("a screenshot path stays inside the session's MCP output dirs", () => {
+    for (const screenshot of ['mcp-b/page-2026-10-19T16-08-14-750Z.png', 'mcp/page-1.jpeg', 'mcp/page-1.jpg']) {
+      expect(findingSchema.safeParse(visual({ screenshot })).success).toBe(true)
+    }
+    for (const screenshot of ['../mcp/page-1.png', 'mcp/../../x.png', '/tmp/mcp/page-1.png', 'mcp/a/b.png', 'x.png']) {
+      expect(findingSchema.safeParse(visual({ screenshot })).success).toBe(false)
+    }
+    expect(findingSchema.safeParse(visual({ screenshot: 'mcp/transcript.json' })).success).toBe(false)
+  })
+
+  test('a visual fingerprint ignores the wording and keeps the element and the function', () => {
+    const a = visual({
+      area: 'onboarding',
+      function: 'onboarding-name',
+      element: 'button "Continue"',
+      oracle: { type: 'visual', evidence: 'the keyboard hides Continue' },
+    })
+    const b = { ...a, oracle: { type: 'visual', evidence: 'Continue sits under the keyboard' } }
+    expect(fingerprint(a)).toBe(fingerprint(b))
+    expect(fingerprint({ ...a, element: 'textbox "Name"' })).not.toBe(fingerprint(a))
+    expect(fingerprint({ ...a, function: 'onboarding-theme' })).not.toBe(fingerprint(a))
+  })
+})
+
 test('each charter names exactly the functions of its list, and says the AI is real only for a real-AI charter', async () => {
   const lists: Record<string, QaFunction[]> = await Bun.file(join(import.meta.dir, '../functions.json')).json()
   for (const [charter, list] of Object.entries(lists)) {
     const text = await Bun.file(join(import.meta.dir, `../charters/${charter}.md`)).text()
     const named = [...text.matchAll(/Functions?:((?:\s+`[\w-]+`[,.]?)+)/g)].flatMap(([, ids]) => ids.match(/[\w-]+/g))
     expect([...new Set(named)].sort(), charter).toEqual(list.map((fn) => fn.id).sort())
-    expect(text.includes('the AI is **real**'), charter).toBe(realAiCharters.has(charter))
+    const real = platformIds.map((platform) => realAiCharters.has(`${charter}-${platform}`))
+    // A charter is real AI on every platform or on none.
+    expect(text.includes('the AI is **real**'), charter).toBe(real.every(Boolean))
+    expect(new Set(real).size, charter).toBe(1)
   }
-  const charters = [...realAiCharters].filter((charter) => !charter.startsWith('free-'))
+  const charters = [...realAiCharters]
+    .map((session) => parseSession(session).charter)
+    .filter((c) => !c.startsWith('free-'))
   expect(charters.filter((charter) => !(charter in lists))).toEqual([])
+})
+
+test('parseSession splits the platform off the last hyphen', () => {
+  expect(parseSession('c1-first-run-phone')).toEqual({ charter: 'c1-first-run', platform: 'phone' })
+  expect(parseSession('free-trip-planner-desktop')).toEqual({ charter: 'free-trip-planner', platform: 'desktop' })
+  expect(() => parseSession('c1-first-run')).toThrow('unknown platform in session id: c1-first-run')
+})
+
+test('real-AI sessions carry their platform', () => {
+  expect(realAiCharters.has('c3-models-providers-phone')).toBe(true)
+  expect(realAiCharters.has('c3-models-providers')).toBe(false)
+  expect(realAiCharters.has('c2-chat-power-user-desktop')).toBe(false)
+})
+
+test('a finding names a known platform', () => {
+  expect(findingSchema.safeParse({ ...finding, viewport: 'phone' }).success).toBe(true)
+  expect(findingSchema.safeParse({ ...finding, viewport: 'tablet' }).success).toBe(false)
 })
 
 test('every free session is real AI, on a platform whose id is a finding viewport, and every case is complete', async () => {
