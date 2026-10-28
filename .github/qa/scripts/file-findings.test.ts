@@ -130,9 +130,12 @@ beforeEach(async () => {
 })
 afterEach(() => rm(outDir, { recursive: true, force: true }))
 
-const writeVerified = async (findings: Partial<RawFinding>[], video?: string, charterDir = 'c2-chat') => {
+/** `priority` is what the judge proposed for that finding, written as is so a test can send a malformed one. */
+type Judged = Partial<RawFinding> & { priority?: string }
+
+const writeVerified = async (findings: Judged[], video?: string, charterDir = 'c2-chat') => {
   const confirmed = []
-  for (const [i, fields] of findings.entries()) {
+  for (const [i, { priority, ...fields }] of findings.entries()) {
     const finding = { ...base, ...fields }
     await mkdir(join(outDir, charterDir, 'repro'), { recursive: true })
     if (finding.screenshot) {
@@ -151,6 +154,7 @@ const writeVerified = async (findings: Partial<RawFinding>[], video?: string, ch
       finding,
       replay: { failed: 3, runs: 3 },
       artifacts: { video },
+      judge: { keep: true, reason: 'A real bug.', priority },
     })
   }
   await writeFile(
@@ -424,6 +428,48 @@ describe('one ticket per bug across platforms', () => {
   })
 })
 
+describe('judged priority', () => {
+  test('a sign-in code field with no accessible name, judged High, files High', async () => {
+    const signInCodeField: Judged = {
+      title: 'Sign-in code field has no accessible name',
+      area: 'auth',
+      charter: 'c1-first-run-desktop',
+      oracle: {
+        type: 'layout',
+        evidence: '[qa-layout] unnamed-control textbox "after If you received a code to log in, enter "',
+      },
+      steps: ['Open http://localhost:1425', 'Enter a fresh email and press Continue', 'Code entry screen shows'],
+      expected: 'The code text field has an accessible name',
+      actual: "The code input below 'If you received a code to log in, enter it here:' has no name",
+      priority: 'High',
+    }
+    await writeVerified([signInCodeField], undefined, 'c1-first-run-desktop')
+    const api = fakeLinear()
+    const [entry] = await run(api.fetchFn)
+    expect(entry).toMatchObject({ action: 'created', severity: 'High' })
+    expect(created(api)[0].priority).toBe(2)
+  })
+
+  test('a malformed judge priority files at the table severity', async () => {
+    await writeVerified([{ priority: 'Critical' }])
+    const api = fakeLinear()
+    const [entry] = await run(api.fetchFn)
+    expect(entry).toMatchObject({ action: 'created', severity: 'Urgent' })
+    expect(created(api)[0].priority).toBe(1)
+  })
+
+  test('one bug on several platforms files with the highest priority any of them was judged', async () => {
+    await writeVerified([
+      { viewport: 'desktop', priority: 'High' },
+      { viewport: 'phone', priority: 'Urgent' },
+    ])
+    const api = fakeLinear()
+    const filed = await run(api.fetchFn)
+    expect(filed.map((f) => f.severity)).toEqual(['Urgent', 'Urgent'])
+    expect(created(api).map((input) => input.priority)).toEqual([1])
+  })
+})
+
 describe('visual findings', () => {
   test('a visual ticket is left to the fix agent, not Human Required, and shows its screenshot', async () => {
     await writeVerified([visualVerified({ screenshot: 'mcp/page-1.png' })])
@@ -461,30 +507,36 @@ describe('visual findings', () => {
     expect(uploads(api)).toEqual([])
   })
 
-  test('an Android layout finding is held back until an Android sweep, and its iOS twin is still filed', async () => {
-    const layout = { type: 'layout', evidence: '[qa-layout] covered button "Preferences"' }
-    const native = { oracle: layout, repro_spec: undefined, repro_flow: 'repro/1.yaml' }
-    // The Android keyboard line comes from the tree rule, not the probe, and still waits for the sweep.
-    const keyboard = { type: 'layout', evidence: '[qa-layout] behind-keyboard textbox "Enter your name"' }
+  test('only an Android covered finding is held back; its iOS twin and other Android kinds are filed', async () => {
+    const covered = { type: 'layout', evidence: '[qa-layout] covered button "Preferences"' }
+    const native = { oracle: covered, repro_spec: undefined, repro_flow: 'repro/1.yaml' }
+    const layout = (evidence: string) => ({ ...native, viewport: 'android', oracle: { type: 'layout', evidence } })
     await writeVerified([
       { ...native, viewport: 'ios' },
       { ...native, viewport: 'android' },
-      { ...native, viewport: 'android', oracle: keyboard },
-      { viewport: 'android', repro_spec: undefined, repro_flow: 'repro/2.yaml' },
+      layout('[qa-layout] behind-keyboard textbox "Enter your name"'),
+      layout('[qa-layout] unnamed-control button "after Connect Google"'),
+      layout('[qa-layout] focus-covered textbox "Email"'),
     ])
     const api = fakeLinear()
 
     const filed = await run(api.fetchFn)
 
-    const held = 'Android layout finding, held back until the probe sweeps correct Android screens clean'
+    const held = 'Android covered finding, held back until the probe sweeps correct Android screens clean'
     expect(filed.map((f) => [f.id, f.action, f.reason]).sort()).toEqual([
       ['0', 'created', undefined],
       ['1', 'refused', held],
-      ['2', 'refused', held],
+      ['2', 'created', undefined],
       ['3', 'created', undefined],
+      ['4', 'created', undefined],
     ])
     const platforms = created(api).map((input) => /\*\*Platforms:\*\* \w+/.exec(input.description)?.[0])
-    expect(platforms.sort()).toEqual(['**Platforms:** android', '**Platforms:** ios'])
+    expect(platforms.sort()).toEqual([
+      '**Platforms:** android',
+      '**Platforms:** android',
+      '**Platforms:** android',
+      '**Platforms:** ios',
+    ])
   })
 
   test.each([

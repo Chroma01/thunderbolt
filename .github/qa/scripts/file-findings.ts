@@ -8,7 +8,15 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { linear } from '../../../scripts/notify-on-failure'
-import { type Finding, findingSchema, fingerprint, platformIds, type Severity, severity } from './findings'
+import {
+  type Finding,
+  findingSchema,
+  fingerprint,
+  judgedSeverity,
+  platformIds,
+  proposedSeveritySchema,
+  type Severity,
+} from './findings'
 import { sanitize, secretPattern } from './sanitize'
 import { imageInfo, screenshotPath, type Verified, type VerifiedFinding } from './verify'
 
@@ -298,10 +306,9 @@ const refusal = (f: Finding) => {
   if (f.oracle.type === 'visual' && !(f.element?.trim() && f.function?.trim())) {
     return 'visual finding without an element and a function to deduplicate on'
   }
-  // A platform files layout tickets only once its probe sweeps correct screens clean; Android's reports
-  // uncovered sidebar buttons as covered.
-  if (f.viewport === 'android' && f.oracle.type === 'layout') {
-    return 'Android layout finding, held back until the probe sweeps correct Android screens clean'
+  // Android's probe reports uncovered sidebar buttons as covered; its other layout kinds file normally.
+  if (f.viewport === 'android' && f.oracle.type === 'layout' && /\[qa-layout\] covered\s/.test(f.oracle.evidence)) {
+    return 'Android covered finding, held back until the probe sweeps correct Android screens clean'
   }
   return undefined
 }
@@ -340,12 +347,14 @@ export const fileFindings = async (opts: FileOptions): Promise<Filed[]> => {
   const filed: Filed[] = []
   const scored = verified.confirmed.flatMap((v) => {
     const f = findingSchema.parse(v.finding)
-    const found = { v, f, fp: fingerprint(v.finding), sev: severity(f) }
+    const sev = judgedSeverity(f, proposedSeveritySchema.parse(v.judge?.priority))
+    const found = { v, f, fp: fingerprint(v.finding), sev }
     const reason = refusal(f)
     if (!reason) return [found]
     filed.push({ fp: found.fp, severity: found.sev, charterDir: v.charterDir, id: v.id, action: 'refused', reason })
     return []
   })
+  // Sorted before grouping, so a group files with the severity of its most severe finding.
   scored.sort((a, b) => priority[a.sev] - priority[b.sev] || a.fp.localeCompare(b.fp))
   const entries: Entry[] = [...Map.groupBy(scored, (s) => s.fp).values()].map((group) => ({
     ...group[0],

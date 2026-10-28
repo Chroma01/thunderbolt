@@ -255,15 +255,19 @@ code from. The fallback is a checkout the job's user cannot write during replay.
 4. **judge** (`verify.ts judge`): one Opus call per confirmed finding with `judge.md` and `known-issues.md`; a
    `visual` finding is judged on its screenshot, a native one on the flow replay ran (the allow list's own
    serialization, read from a path checked like a screenshot's). For a `layout` finding the replayed probe
-   line is the proof and a screenshot only context. The default answer is drop. Writes `verified.json`.
-5. **file** (`file-findings.ts`): fingerprint dedupe, severity table, ticket caps and roll-ups, secret refusal.
+   line is the proof and a screenshot only context. The default answer is drop. The judge also proposes the
+   ticket's priority from a four-line rubric in `judge.md`. Writes `verified.json`.
+5. **file** (`file-findings.ts`): fingerprint dedupe, severity, ticket caps and roll-ups, secret refusal.
+   A table keyed on area and oracle type gives each finding a starting severity. The judge's priority may move it
+   one level up or down, but a console error or an overflow never goes above Medium. A missing or unknown
+   priority keeps the table's value. Findings that share a fingerprint file with the highest severity among them.
    Dry run unless `--live`. The fingerprint ignores the platform, so findings that share one become one ticket
    whose `**Platforms:**` line lists every platform that found the bug, and an open ticket gets one comment with
    that line. A `visual` finding's fingerprint is its area, function and element (`<role> "<name>"`), never its
    wording; one without an element or a function is refused. Its ticket names the element and embeds the screenshot, uploaded with the content type its bytes declare. A `security` finding uploads no screenshot and no video.
-   An Android `layout` finding is refused too, with its reason in the report, until the probe has swept correct
-   Android screens clean (see "Known limits"). It still replays and is judged, and an iOS finding of the same bug is
-   filed as usual.
+   An Android `layout` finding of the `covered` kind is refused too, with its reason in the report, until the probe
+   has swept correct Android screens clean (see "Known limits"). It still replays and is judged, and an iOS finding
+   of the same bug is filed as usual. Every other Android layout kind files like any platform.
 6. **fix** (off by default, `fix.ts` and `fix.md`): at most 3 confirmed tickets a week, highest severity first,
    one per fingerprint, from any area. A ticket whose `qa-fix/<fp>` branch still exists waits for a later week.
    A `spec` task's original spec must pass 3 times on the patch; a run that fails anywhere, even before its
@@ -496,8 +500,9 @@ it: the backend and the fakes, with no Vite, since the app carries its own front
 
 # A booted device (its id on stdout), the app on it, and the console in the background.
 udid=$(.github/qa/scripts/native.sh device ios)
-.github/qa/scripts/native.sh install ios "$udid" "/tmp/qa-ios/Thunderbolt Dev.app"
 .github/qa/scripts/native.sh logs ios "$udid" /tmp/webview.log
+.github/qa/scripts/native.sh install ios "$udid" "/tmp/qa-ios/Thunderbolt Dev.app"
+.github/qa/scripts/native.sh wait-logs "$udid" /tmp/webview.log           # iOS only: until the stream has attached
 
 # A session on it: the canary first, then the session (both need ANTHROPIC_API_KEY). The backend log is the one
 # `stack.sh start` writes. QA_DRY_RUN=1 prints the claude command and its hook settings instead.
@@ -566,8 +571,14 @@ Traps:
 - `simctl addmedia` aborts on a file it cannot read as media, even when the Maestro step says `optional`, so
   `device ios` adds only `fixtures/*.png`, never the `.txt` files.
 - The console reaches the iOS system log only with `WebKitDebugLogsPageMessagesToSystemConsoleEnabled` set, which
-  `device ios` does, and lines logged before `log stream` attaches are lost, so `logs ios` returns once the
-  stream's `Filtering the log data` header shows up. Piping it into `tail` hangs the shell; it runs in the
+  `device ios` does, and lines logged before `log stream` attaches are lost, so a session must not start before the
+  stream's `Filtering the log data` header shows up. `logs ios` only starts the stream and records the time;
+  `wait-logs` waits for the header. The workflow runs `logs ios` right after the boot, so the stream attaches while
+  the app installs and the stack starts, and `wait-logs` just before the first step that reads the log. On a slow
+  runner the header can take a minute or never come: `wait-logs` replaces a stream that is still silent 60 s after
+  its start, once, and fails with "the log stream never attached" when the replacement is silent for 60 s as well.
+  The first stream's wait counts from its start, so time spent on the install is not waited twice; the replacement
+  gets its own 60 s even when the install already used the first stream's. Piping it into `tail` hangs the shell; it runs in the
   background and `stop-logs` stops it by pid.
 - On macOS the stack must run under the system `/bin/bash` 3.2 as well: `serve` polls its servers instead of using
   `wait -n`, which 3.2 lacks.
@@ -599,7 +610,7 @@ Android on `ubuntu-latest` with KVM.
   the app, because an artifact drops file modes.
 - **explore-native**, one job per native session: Maestro 2.11.0 from the official installer on both platforms,
   Claude Code 2.1.303, the app the session needs (the onboarding build for c1), the device, `stack.sh start native`
-  and the console stream. `c7-two-devices-android` also gets Postgres, PowerSync, the web build on 1424 by default
+  and the console stream (on iOS started right after the device, on Android after the install). `c7-two-devices-android` also gets Postgres, PowerSync, the web build on 1424 by default
   (`stack.sh start qa-dist`) and the second browser's Chromium. The app reaches PowerSync on `localhost:18081`:
   `native.sh device` reverses that port too, and a QA build's CSP allows it. Android's real-AI sessions run the
   backend as `qa-backend` and lock root, as the web real legs do. Then the harness (see "Native explore on macOS"),
@@ -958,9 +969,9 @@ Also:
   (button, checkbox, radio, switch, textbox, combobox, and searchbox, which the WebView shows as a text field), and
   on iOS the checkbox, radio and switch lines. Any other role keeps the probe's line, the same one the web gives: a
   link on both platforms, and a button or field on iOS.
-- Android `layout` findings replay, are judged and show in the report, but are never filed or fixed (`refusal` in
-  `file-findings.ts`). Layout tickets need a clean probe sweep of correct screens on each platform first, and
-  Android's sweep has not run. On Android the probe has logged `covered button`
+- Android `layout` findings of the `covered` kind replay, are judged and show in the report, but are never filed or
+  fixed (`refusal` in `file-findings.ts`); every other Android kind files like any platform. Covered tickets need a clean probe sweep of correct screens
+  on each platform first, and Android's sweep has not run. On Android the probe has logged `covered button`
   for the sidebar's buttons while the screenshots show them uncovered, or off screen with the drawer closed. The
   lines came only as the drawer closed, or as it opened after a relaunch, and on opening only the buttons farthest
   from the left edge were logged, the ones the sliding page uncovers last. The drawer's animation outlasting the
