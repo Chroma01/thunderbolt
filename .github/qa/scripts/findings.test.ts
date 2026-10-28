@@ -39,7 +39,6 @@ const finding: Finding = {
   repro_spec: 'repro/1.spec.ts',
 }
 
-/** The finding with some fields replaced. */
 const variant = (fields: Partial<RawFinding>): RawFinding => ({ ...finding, ...fields })
 
 describe('loadFindings', () => {
@@ -82,7 +81,6 @@ describe('hasOracle', () => {
   })
 })
 
-/** A spec whose body runs inside a test that has `page`. */
 const spec = (body: string) => `import { test, expect, type Page } from '@playwright/test'
 import { loginViaEmailCode } from '../../../e2e/helpers'
 
@@ -297,7 +295,7 @@ describe('layout oracle', () => {
     expect(severity(layoutFinding('onboarding', '[qa-layout] unnamed-control checkbox "after Consent"'))).toBe('High')
   })
 
-  test('overflow is no longer an oracle', () => {
+  test('overflow is not an oracle type', () => {
     expect(hasOracle(variant({ oracle: { type: 'overflow', evidence: 'x' } }))).toBe(false)
     expect(hasOracle(variant({ oracle: { type: 'layout', evidence: '[qa-layout] covered button "Go"' } }))).toBe(true)
   })
@@ -327,7 +325,6 @@ describe('layout oracle', () => {
 })
 
 describe('visual oracle', () => {
-  /** A visual finding: a screenshot the explorer took instead of a repro spec. */
   const visual = (fields: Partial<RawFinding>): RawFinding => ({
     ...finding,
     area: 'layout',
@@ -370,7 +367,6 @@ describe('visual oracle', () => {
 })
 
 describe('native findings', () => {
-  /** A finding from the iOS app, proven by a Maestro flow. */
   const native = (fields: Partial<RawFinding>): RawFinding => ({
     ...finding,
     viewport: 'ios',
@@ -470,13 +466,13 @@ test('a finding names a known platform', () => {
 
 test('every free session is real AI where the platform has real providers, and every case is complete', async () => {
   for (const { id, driver, realAi, viewport, mcp } of platforms) {
-    // A session id is free-<case>-<platform>; a platform id without hyphens keeps the case readable before it.
+    // Session ids are free-<case>-<platform>, so a hyphen-free platform id keeps the case readable.
     expect(id).toMatch(/^[a-z]+$/)
     expect(cases.every((c) => realAiCharters.has(`free-${c.id}-${id}`))).toBe(realAi)
     const repro = nativePlatformIds.includes(id) ? { repro_spec: undefined, repro_flow: 'repro/1.yaml' } : {}
     expect(findingSchema.safeParse({ ...finding, ...repro, viewport: id }).success, id).toBe(true)
     if (driver === 'playwright') expect(viewport).toMatch(/^\d+x\d+$/)
-    // The Maestro config arrives with the native tasks.
+    // explore.sh hard-codes the Maestro gate's config, so only the Playwright paths in platforms.json are checked.
     if (driver === 'playwright') expect(await Bun.file(join(import.meta.dir, '../../..', mcp)).exists()).toBe(true)
   }
   expect(new Set(cases.map((c) => c.id)).size).toBe(cases.length)

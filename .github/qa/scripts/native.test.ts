@@ -11,7 +11,7 @@ const native = join(import.meta.dir, 'native.sh')
 const work = mkdtempSync(join(tmpdir(), 'qa-native-'))
 afterAll(() => rmSync(work, { recursive: true, force: true }))
 
-// The stack's port variables unset, so a caller's shell cannot change what a test expects of the defaults.
+// The port variables are unset so a caller's shell cannot change the defaults a test expects.
 const noPorts = {
   QA_FRONTEND_PORT: '',
   QA_ONBOARDING_PORT: '',
@@ -21,10 +21,7 @@ const noPorts = {
   QA_GOOGLE_PORT: '',
 }
 
-/**
- * A stand-in `adb` for a booted emulator that logs every call: `/sdcard` resolves only from the second check on, as
- * after `sys.boot_completed` on the runner, and Android 16 refuses the push of sample.png.
- */
+/** `/sdcard` resolves only from the second check on, and Android 16 refuses the push of sample.png. */
 const fakeAdb = () => {
   const bin = mkdtempSync(join(work, 'bin-'))
   const calls = join(bin, 'calls.log')
@@ -50,7 +47,6 @@ exit 0
 test('verify-run hands verify.ts the app, the fp from the result name and the original app, then stops its log stream', () => {
   const bin = mkdtempSync(join(work, 'bin-'))
   const args = join(bin, 'bun-args')
-  // A log stream that attaches and then waits to be stopped, and a bun that only records its arguments.
   writeFileSync(join(bin, 'xcrun'), "#!/bin/bash\necho 'Filtering the log data'\nsleep 3\n")
   writeFileSync(join(bin, 'bun'), `#!/bin/bash\nprintf '%s\\n' "$@" > '${args}'\n`)
   for (const tool of ['xcrun', 'bun']) chmodSync(join(bin, tool), 0o755)
@@ -116,9 +112,8 @@ test('device android reverses the stack ports it is configured with', () => {
 })
 
 /**
- * `install android` against a stand-in `adb`: launch n runs as pid 400n (the first one shows up on the second look,
- * the later ones at once, so a busy machine cannot run a launch's second out before its pid shows), and logs
- * the storage check of run 39380764343. Only launch `step1At` gets past it to `[init] step1_`; 0 means none does.
+ * Launch n runs as pid 400n. The first pidof look finds no pid and later ones find it, even from launch 2 on when
+ * a slow machine spent launch 1's 1 s on one look. Only launch `step1At` reaches `[init] step1_`, and 0 means none.
  */
 const warmUp = (step1At: number) => {
   const bin = mkdtempSync(join(work, 'bin-'))
@@ -139,9 +134,8 @@ exit 0
 `
   writeFileSync(join(bin, 'adb'), script)
   chmodSync(join(bin, 'adb'), 0o755)
-  // One second per launch instead of thirty.
   const proc = Bun.spawnSync(['bash', native, 'install', 'android', 'emulator-5554', '/apps/app-debug.apk'], {
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, QA_WARM_SECONDS: '1' },
+    env: { ...process.env, ...noPorts, PATH: `${bin}:${process.env.PATH}`, QA_WARM_SECONDS: '1' },
   })
   return { proc, log: readFileSync(calls, 'utf8').trim().split('\n') }
 }
@@ -165,6 +159,15 @@ test('install android relaunches the app until a launch gets past the storage ch
   expect(log.slice(launches[0], launches[1])).toContain(forceStop)
   expect(log.slice(launches[1])).toContain('-s emulator-5554 logcat -d --pid=4002 -s Tauri/Console:*')
   expect(log.at(-1)).toBe(forceStop)
+})
+
+test('install android maps the stack ports again before the first launch, since an adb reset drops them', () => {
+  const { proc, log } = warmUp(2)
+  expect(proc.exitCode).toBe(0)
+  const firstLaunch = log.findIndex((line) => line.includes(' shell monkey '))
+  expect(log.slice(2, firstLaunch)).toEqual(
+    ['8005', '9878', '9879', '9880', '18081'].map((port) => `-s emulator-5554 reverse tcp:${port} tcp:${port}`),
+  )
 })
 
 test('install ios removes the app first, so the session starts on the first-run screens a replay run sees', () => {

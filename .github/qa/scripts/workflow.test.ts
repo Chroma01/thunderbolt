@@ -2,8 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-// The weekly workflow's trust boundaries, read from the YAML with its aliases resolved, and the two steps that decide
-// whether a fix may become a PR, run as the workflow runs them.
+// The workflow's trust boundaries, read from the resolved YAML, and the steps that gate a fix PR.
 
 import { afterAll, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -11,10 +10,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   extraRuns,
+  nativeDriverStartupMinutes,
   nativeJobMinutes,
   nativeReplayCap,
-  nativeRunMinutes,
-  nativeSetupMinutes,
+  nativeRunEstimateMinutes,
+  nativeSetupEstimateMinutes,
   nativeWrapUpMinutes,
 } from './verify'
 
@@ -200,13 +200,12 @@ describe('fix job', () => {
       expect(check).toContain(`sport = :${ports[name]}`)
   })
 
-  test("the agent may not edit git, the pipeline, e2e or the tool configs", () => {
+  test('the agent may not edit git, the pipeline, e2e or the tool configs', () => {
     const args = step('fix', 'Fix').with?.claude_args ?? ''
     for (const rule of ['.git/**', '.github/**', 'e2e/**', '**/vite.config.*', '**/tsconfig*.json', '**/.husky/**'])
       expect(args).toContain(`"Edit(${rule})"`)
   })
 
-  // Runs the collect step's script in a scratch repo, with the outcomes the workflow would pass.
   const collect = (env: Record<string, string>) => {
     const dir = mkdtempSync(join(work, 'collect-'))
     const git = (...args: string[]) => Bun.spawnSync(['git', '-C', dir, ...args])
@@ -248,8 +247,7 @@ describe('fix job', () => {
     expect(at('Build the patched frontend for the real-AI check')).toBeLessThan(at('Collect the patch'))
   })
 
-  // Runs the baseline step in a scratch repo whose stack.sh records the backend it would serve, with the agent's edits
-  // (`edits`) in the tree and a check that always fails, as it should without the patch.
+  // The check always fails, as it should without the patch.
   const baseline = ({ edits = true, failStart = false, stashed = false } = {}) => {
     const dir = mkdtempSync(join(work, 'baseline-'))
     const bin = mkdtempSync(join(work, 'bin-'))
@@ -307,19 +305,22 @@ describe('fix job', () => {
 
 describe('publish', () => {
   type Verdict = { passed?: boolean; failsWithout?: boolean; passesWith?: boolean }
-  // Runs publish's verdict step on a qa-out holding the plan, the given verdicts and the fix job's diagnosis.
   const verdicts = (files: Record<string, Verdict>, env: Record<string, string> = {}, diagnosis?: string) => {
     const dir = mkdtempSync(join(work, 'publish-'))
     mkdirSync(join(dir, 'qa-out/verify'), { recursive: true })
     mkdirSync(join(dir, 'qa-out/fix'), { recursive: true })
     const verifyNative = ['ios', 'android'].map((platform) => ({ fp: 'fp1', platform }))
     writeFileSync(join(dir, 'qa-out/fix-plan.json'), JSON.stringify({ fixes: [], verifyNative }))
-    for (const [path, content] of Object.entries(files)) writeFileSync(join(dir, 'qa-out', path), JSON.stringify(content))
+    for (const [path, content] of Object.entries(files))
+      writeFileSync(join(dir, 'qa-out', path), JSON.stringify(content))
     if (diagnosis) writeFileSync(join(dir, 'qa-out/fix/fp1.diagnosis.md'), diagnosis)
-    const proc = Bun.spawnSync(['bash', '-e', '-c', step('publish', 'Require the native and real-AI checks').run ?? ''], {
-      cwd: dir,
-      env: { PATH: process.env.PATH, QA_FP: 'fp1', ...env },
-    })
+    const proc = Bun.spawnSync(
+      ['bash', '-e', '-c', step('publish', 'Require the native and real-AI checks').run ?? ''],
+      {
+        cwd: dir,
+        env: { PATH: process.env.PATH, QA_FP: 'fp1', ...env },
+      },
+    )
     expect(proc.exitCode).toBe(0)
     const read = (path: string) =>
       existsSync(join(dir, 'qa-out', path)) ? readFileSync(join(dir, 'qa-out', path), 'utf8') : undefined
@@ -335,7 +336,7 @@ describe('publish', () => {
     expect(failed.diagnosis).toContain('(android)')
   })
 
-  test("needs the real-AI verdict for a web real-AI task", () => {
+  test('needs the real-AI verdict for a web real-AI task', () => {
     const both = { 'verify/fp1.ios.json': passed, 'verify/fp1.android.json': passed }
     expect(verdicts(both, { REAL: 'true' }).diagnosis).toContain('real AI providers')
     expect(verdicts({ ...both, 'verify/fp1.real.json': { passed: true } }, { REAL: 'true' }).diagnosis).toBeUndefined()
@@ -357,7 +358,9 @@ describe('publish', () => {
 
 test("a native replay leg's worst case fits its timeout, since a timeout loses every finding of the leg", () => {
   const runs = 3 + nativeReplayCap * (3 + extraRuns)
-  expect(runs * nativeRunMinutes + nativeSetupMinutes + nativeWrapUpMinutes).toBeLessThan(nativeJobMinutes)
+  const minutes =
+    runs * nativeRunEstimateMinutes + nativeSetupEstimateMinutes + nativeWrapUpMinutes + nativeDriverStartupMinutes
+  expect(minutes).toBeLessThan(nativeJobMinutes)
   // verify.ts stops starting runs by this number, so it must be the job's own.
   expect(jobs['replay-native']['timeout-minutes']).toBe(nativeJobMinutes)
   // ...counted from the job's first step, so the setup before the replay step is on the clock.
@@ -367,7 +370,7 @@ test("a native replay leg's worst case fits its timeout, since a timeout loses e
 describe('native jobs', () => {
   const maestroJobs = Object.entries(jobs).filter(([, job]) => JSON.stringify(job).includes('MAESTRO_DRIVER_STARTUP'))
 
-  test("every job that runs Maestro turns off its AI banner, which filled run 39391108579's replay error", () => {
+  test("every job that runs Maestro turns off its AI banner, which fills a failed run's error", () => {
     expect(maestroJobs.map(([name]) => name).sort()).toEqual([
       'explore-native',
       'native-control',
@@ -396,21 +399,34 @@ describe('native jobs', () => {
     expect(at).toBeLessThan(indexOf('native-control', 'Boot the device'))
   })
 
-  test('a failed control uploads the backend and WebView logs, never from a leg whose backend held keys', () => {
+  test('a failed control uploads its logs, an Android replay always does, never a leg whose backend held keys', () => {
     const control = step('native-control', 'Upload the stack log')
     expect(control.if).toBe('failure()')
     expect(control.with?.path).toBe('${{ runner.temp }}/qa-stack.log')
     // The control's own folder, uploaded always, already holds its WebView log.
     expect(steps('native-control').find((s) => s.with?.path === '${{ runner.temp }}/qa-control/')?.if).toBe('always()')
-    const replayLogs = step('replay-native', 'Upload the stack and WebView logs')
-    expect(replayLogs.if).toBe('failure() && !matrix.leg.real')
+    const upload = 'Upload the stack, device and Maestro logs'
+    const save = "Save the emulator's, adb's and Maestro's logs"
+    const replayLogs = step('replay-native', upload)
+    // On Android also after a replay that passed, to show whether the console stream lasted the leg.
+    expect(replayLogs.if).toBe("(failure() || matrix.leg.platform == 'android') && !matrix.leg.real")
+    expect(step('replay-native', save).if).toBe("always() && matrix.leg.platform == 'android' && !matrix.leg.real")
     expect(replayLogs.with?.path?.split('\n').filter(Boolean)).toEqual([
       '${{ runner.temp }}/qa-stack.log',
       '${{ runner.temp }}/qa-webview.log',
+      '${{ runner.temp }}/qa-logcat.log',
+      '${{ runner.temp }}/qa-adb.log',
+      '${{ runner.temp }}/qa-maestro/',
     ])
-    expect(indexOf('replay-native', 'Upload the stack and WebView logs')).toBeGreaterThan(
-      indexOf('replay-native', 'Replay the repro flows and specs'),
-    )
+    expect(indexOf('replay-native', save)).toBeGreaterThan(indexOf('replay-native', 'Replay the repro flows and specs'))
+    expect(indexOf('replay-native', upload)).toBeGreaterThan(indexOf('replay-native', save))
+  })
+
+  test("Android's replay starts Maestro's driver once, before the console stream that a reset there would end", () => {
+    const warmUp = "Start Maestro's driver on the emulator"
+    expect(step('replay-native', warmUp).if).toBe("matrix.leg.platform == 'android'")
+    expect(indexOf('replay-native', warmUp)).toBeGreaterThan(indexOf('replay-native', 'Boot the device'))
+    expect(indexOf('replay-native', warmUp)).toBeLessThan(indexOf('replay-native', 'Stream the WebView console'))
   })
 })
 

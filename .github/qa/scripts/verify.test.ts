@@ -15,6 +15,7 @@ import { measureNative, parseInspectScreen } from '../native-layout'
 import {
   judge,
   legStartOf,
+  nativeJobMinutes,
   nativeReplayCap,
   oracleOf,
   replay,
@@ -58,7 +59,6 @@ const pageError = { type: 'page-error', evidence: 'TypeError: messages is undefi
 
 const shotFile = 'page-2026-10-19T16-08-14-750Z.png'
 
-/** A visual finding: a screenshot under the session's `mcp/` instead of a repro spec. */
 const makeVisual = (title: string, screenshot = `mcp/${shotFile}`): RawFinding => ({
   ...makeFinding(title, { type: 'visual', evidence: 'The send button sits under the composer toolbar' }),
   area: 'layout',
@@ -68,10 +68,7 @@ const makeVisual = (title: string, screenshot = `mcp/${shotFile}`): RawFinding =
   repro_spec: undefined,
 })
 
-/**
- * What Playwright MCP 0.0.83 returns for `browser_take_screenshot` without a filename, run with
- * `--file-paths absolute`; transcript.json keeps the text block only, not the image.
- */
+/** Playwright MCP's `browser_take_screenshot` result with absolute file paths; transcript.json keeps the text only. */
 const screenshotResult = (dir: string, file = shotFile) =>
   `### Result\n- [Screenshot of viewport](${dir}/${file})\n### Ran Playwright code\n\`\`\`js\n` +
   `// Screenshot viewport and save it as ${dir}/${file}\nawait page.screenshot({\n  path: '${dir}/${file}',\n` +
@@ -85,7 +82,7 @@ const callsOf = (steps: (readonly [string, string])[]): TranscriptMessage[] =>
     { message: { content: [{ type: 'tool_result' as const, tool_use_id: `t${i}`, content: result }] } },
   ])
 
-/** The start of a PNG of that size: its signature and IHDR chunk, all the screenshot checks read. */
+/** The signature and IHDR chunk, all the screenshot checks read. */
 const pngOf = (width: number, height: number) => {
   const ihdr = Buffer.alloc(8)
   ihdr.writeUInt32BE(width, 0)
@@ -93,10 +90,7 @@ const pngOf = (width: number, height: number) => {
   return Buffer.concat([Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'), ihdr])
 }
 
-/**
- * The start of a JPEG of that size: SOI, an APP0 and a DHT segment to skip (DHT's marker, C4, sits among the
- * frame-header markers), then the SOF0 frame header.
- */
+/** SOI, an APP0 and a DHT segment to skip (marker C4 sits among the frame-header markers), then SOF0. */
 const jpegOf = (width: number, height: number) => {
   const sof = Buffer.from('ffc0001108000000000301', 'hex')
   sof.writeUInt16BE(height, 5)
@@ -124,13 +118,11 @@ afterEach(async () => {
   await rm(qaDir, { recursive: true, force: true })
 })
 
-/** Writes `c2-chat-desktop/findings/<title>.json` and, unless `spec` is null, its repro spec. */
 const writeFinding = async (finding: RawFinding, spec: string | null = validSpec(finding.title)) => {
   await Bun.write(join(outDir, 'c2-chat-desktop/findings', `${finding.title}.json`), JSON.stringify(finding))
   if (spec !== null && finding.repro_spec) await Bun.write(join(outDir, 'c2-chat-desktop', finding.repro_spec), spec)
 }
 
-/** Writes c2-chat-desktop's transcript with the given tool calls, and the screenshot file `mcp/<shotFile>`. */
 const writeSession = async (steps: (readonly [string, string])[]) => {
   await Bun.write(join(outDir, 'c2-chat-desktop/transcript.json'), JSON.stringify(callsOf(steps)))
   await Bun.write(join(outDir, 'c2-chat-desktop/mcp', shotFile), pngBytes)
@@ -138,17 +130,12 @@ const writeSession = async (steps: (readonly [string, string])[]) => {
 
 const controlSpec = () => join(qaDir, 'control/stack.spec.ts')
 
-/** The bug step of a run with that status: holding the error when the run failed or timed out. */
 const bugStepOf = (status: string) =>
   status === 'failed' || status === 'timedOut'
     ? [{ title: 'bug check', duration: 12, error: { message: 'Error: expect(locator).toBeVisible() failed' } }]
     : [{ title: 'bug check', duration: 12 }]
 
-/**
- * A runner that reports the given result statuses per spec file (relative to `outDir`), one Playwright spec entry
- * per run, plus the control spec's statuses. Every run carries a long, colored error message, and a failed one fails
- * inside its bug step.
- */
+/** Every run carries a long, colored error message, and a failed one fails inside its bug step. */
 const fakeRunner =
   (statuses: Record<string, string[]>, calls: string[][], control = ['passed', 'passed', 'passed']): RunReplay =>
   async (specs) => {
@@ -237,7 +224,7 @@ describe('replay', () => {
     expect(lint[1].reason).toContain('"process" is not allowed')
   })
 
-  test('failed 3/3 is confirmed, 1–2/3 flaky and 0/3 dropped, keeping the first failed run details', async () => {
+  test('failed 3/3 is confirmed, 1 or 2 of 3 flaky and 0/3 dropped, keeping the first failed run details', async () => {
     for (const title of ['always', 'twice', 'once', 'never']) await writeFinding(makeFinding(title, pageError))
     // Two findings with one spec share its replay.
     await writeFinding({ ...makeFinding('always-again', pageError), repro_spec: 'repro/always.spec.ts' }, null)
@@ -376,12 +363,9 @@ describe('replay', () => {
 
   type ReplayResult = ReplayReport['suites'][number]['specs'][number]['tests'][number]['results'][number]
   const expectFailed = 'Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBe'
-  /**
-   * Results as Playwright 1.60's JSON reporter wrote them, cut to what replay reads. The reporter leaves `steps` out
-   * when the run entered none.
-   */
+  /** The JSON reporter leaves `steps` out when the run entered none. */
   const playwrightResults = {
-    // The local validation's c1 spec: a 429 on the code request, so the sign-in waited for the code input forever.
+    // A c1 spec where the code request got a 429, so the sign-in waited for the code input forever.
     signInTimeout: {
       status: 'timedOut',
       errors: [
@@ -409,7 +393,7 @@ describe('replay', () => {
       errors: [{ message: expectFailed }],
       attachments: [],
     },
-    // A test timeout while the step still ran: no error on the step, and a duration of -1.
+    // A test timeout while the step still ran: no error on the step.
     timedOutInStep: {
       status: 'timedOut',
       steps: [{ title: 'bug check', duration: -1 }],
@@ -439,7 +423,6 @@ describe('replay', () => {
     },
   } satisfies Record<string, ReplayResult>
 
-  /** A runner reporting the given results per spec file (relative to `outDir`), one spec entry per result. */
   const resultsRunner =
     (results: Record<string, ReplayResult[]>): RunReplay =>
     async () => ({
@@ -678,13 +661,12 @@ test('loose', async ({ page }) => {
     ])
   })
 
-  /** A Write or Edit call on `file_path`, as transcript.jq keeps it, and its result. */
+  /** A Write or Edit call as transcript.jq keeps it, and its result. */
   const fileTool = (name: string, id: string, file_path: string): TranscriptMessage[] => [
     { message: { content: [{ type: 'tool_use', id, name, input: { file_path } }] } },
     { message: { content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } },
   ]
 
-  /** Writes each screenshot under c2-chat-desktop/mcp/, a visual finding named after it, and a transcript taking them all. */
   const writeShots = async (shots: Record<string, Buffer>, extra: TranscriptMessage[] = []) => {
     const steps = Object.keys(shots).map(
       (name) => ['mcp__playwright__browser_take_screenshot', screenshotResult(`${sessionDir}/mcp`, name)] as const,
@@ -808,7 +790,6 @@ describe('replay of native flows', () => {
   const layout = { type: 'layout', evidence: nameLine }
   const assertFailed = { type: 'assert-failed', evidence: 'The sent message never shows' }
 
-  /** An iOS finding proven by `repro/<title>.yaml`. */
   const makeNative = (title: string, oracle: RawFinding['oracle']): RawFinding => ({
     ...makeFinding(title, oracle),
     charter: 'c2-chat-power-user',
@@ -816,14 +797,10 @@ describe('replay of native flows', () => {
     repro_spec: undefined,
     repro_flow: `repro/${title}.yaml`,
   })
-  /**
-   * A flow that asserts its own title, so the fake device can tell flows apart, and ends on the screen, as a layout
-   * flow must.
-   */
+  /** Asserts its own title so the fake device can tell flows apart, and ends on the screen, as a layout flow must. */
   const flowOf = (title: string) =>
     `- launchApp\n- inputText: \${EMAIL}\n- assertVisible: ${title}\n- waitForAnimationToEnd\n`
 
-  /** Writes `<dir>/findings/<title>.json` and, unless `flow` is null, its repro flow. */
   const writeNative = async (finding: RawFinding, flow: string | null = flowOf(finding.title), dir = session) => {
     await Bun.write(join(outDir, dir, 'findings', `${finding.title}.json`), JSON.stringify(finding))
     if (flow !== null) await Bun.write(join(outDir, dir, 'repro', `${finding.title}.yaml`), flow)
@@ -873,7 +850,7 @@ describe('replay of native flows', () => {
   })
 
   test('an unnamed button the run passes, like the onboarding Back arrow, never confirms another one', async () => {
-    // The tree's lines on the recorded Connect Google step: its Back arrow, and its Continue button without a name.
+    // The Connect Google step has a Back arrow and a Continue button without a name.
     const step = await Bun.file(join(import.meta.dir, '../fixtures/native/inspect-android-onboarding.json')).text()
     const linesOf = (json: string) => measureNative(parseInspectScreen(json), 'android').problems
     const back = linesOf(step)
@@ -990,7 +967,6 @@ describe('replay of native flows', () => {
   })
 
   test('a layout run whose flow stopped before the line is inconclusive and run again, up to 3 extra runs', async () => {
-    // Run 39380764343: of three iOS runs, two stopped on earlier screens and one reached the clipped name field.
     const early = { passed: false, error: 'Assertion is false: "What should we call you?" is visible' }
     const seen = { layout: ['[qa-layout] ready', nameLine] }
     const unseen = { layout: ['[qa-layout] ready'] }
@@ -1023,8 +999,7 @@ describe('replay of native flows', () => {
       ['run5', 3, 3, 2],
       ['real', 2, 3, 1],
     ])
-    // 3 extra runs and still only two conclusive: flaky, whatever those two showed. A passed run without the line
-    // counts as not shown and is not run again.
+    // Still only two conclusive: flaky, whatever those two showed. A passed run without the line is not run again.
     expect(result.flaky.map(counts)).toEqual([
       ['passing', 2, 3, 0],
       ['stuck', 2, 2, 4],
@@ -1104,7 +1079,7 @@ describe('replay of native flows', () => {
   })
 
   test("a finding's viewport comes from its session dir, so an iOS finding written as phone replays as ios", async () => {
-    // Run 39373388149: both native sessions copied the template's "phone" into every finding.
+    // Native sessions copy the template's "phone" into every finding.
     await writeNative({ ...makeNative('name', layout), viewport: 'phone' })
     const calls: FlowCall[] = []
     const run = { layout: ['[qa-layout] ready', nameLine] }
@@ -1194,7 +1169,7 @@ describe('replay of native flows', () => {
   })
 
   test('a flow that waits for the first screen without typing the code is signed in by the harness first', async () => {
-    // Run 39391108579: every iOS flow pressed Continue and then waited for the welcome screen, with no code typed.
+    // iOS flows press Continue and then wait for the welcome screen, with no code typed.
     const c1 = 'c1-first-run-ios'
     const welcome = '- extendedWaitUntil:\n    visible: Welcome to Thunderbolt!\n    timeout: 60000\n'
     const partial = `- launchApp\n- tapOn: Email\n- inputText: \${EMAIL}\n- tapOn: Continue\n${welcome}- tapOn: Skip\n`
@@ -1203,7 +1178,7 @@ describe('replay of native flows', () => {
     await writeNative(makeNative('typed', layout), typed, c1)
     // A bug on the sign-in screen itself never waits for a later one.
     await writeNative(makeNative('login', layout), '- launchApp\n- tapOn: Email\n', c1)
-    // Run 39391108579's flows wrote the chat's ellipsis as three dots.
+    // Flows write the chat's ellipsis as three dots.
     const chat = '- launchApp\n- extendedWaitUntil:\n    visible:\n      text: Ask me anything...\n'
     await writeNative(makeNative('chat', layout), chat)
     const flows = new Map<string, { flow: unknown[]; signIn?: unknown[] }>()
@@ -1215,7 +1190,7 @@ describe('replay of native flows', () => {
     await replay(outDir, fakeRunner({}, []), qaDir, record)
 
     const signIn = await readSignIn()
-    // Control first, then the findings in path order: c1's login, typed and unsigned, then c2's chat.
+    // Control first, then the findings in path order.
     expect([...flows.values()].slice(1)).toEqual([
       { flow: asWritten('- launchApp\n- tapOn: Email\n') },
       { flow: asWritten(typed) },
@@ -1236,7 +1211,7 @@ describe('replay of native flows', () => {
     const { runFlow } = z.object({ runFlow: z.object({ when: z.object({}).loose() }).loose() }).parse(block)
     return [wizard, settle, { runFlow: { ...runFlow, when: { ...runFlow.when, notVisible: text } } }]
   }
-  /** Replays the c1 flows and returns each finding's first run, as the device got it. */
+  /** Each finding's first run, as the device got it. */
   const firstRuns = async (flows: Record<string, { flow: string; oracle: RawFinding['oracle'] }>) => {
     for (const [title, { flow, oracle }] of Object.entries(flows))
       await writeNative(makeNative(title, oracle), flow, c1)
@@ -1350,7 +1325,7 @@ describe('replay of native flows', () => {
   })
 
   test('a native run proves the bug only by failing at its last command, or for a log oracle by the line', async () => {
-    // The local validation's iOS finding: the location search never found "Berlin", well before the assertion.
+    // 'early' fails on its first tap, well before the assertion.
     const flow = (broken: string, last: string) => `- launchApp\n- tapOn: ${broken}\n- assertNotVisible: ${last}\n`
     await writeNative(makeNative('early', assertFailed), flow('Broken search', 'early'))
     await writeNative(makeNative('late', assertFailed), flow('Search', 'Broken late'))
@@ -1372,9 +1347,10 @@ describe('replay of native flows', () => {
     ])
   })
 
+  const ninetyMinuteLeg = (90 - nativeJobMinutes) * 60_000
+  const outOfTime = `out of time: another run might not end before the leg's ${nativeJobMinutes}-minute timeout`
+
   test('a leg stops starting runs before its timeout, keeping time for later findings, and says why', async () => {
-    // Run 39391108579: 18 inconclusive iOS runs of about 3.5 minutes each ran the leg into its 90-minute timeout.
-    // The job started at minute 0 and its setup took 10 minutes, longer on Android than on iOS.
     const minutes = 8
     const clock = { now: 10 * 60_000 }
     const early = { passed: false, error: 'Assertion is false: "What should we call you?" is visible' }
@@ -1393,17 +1369,70 @@ describe('replay of native flows', () => {
       return { passed: true, layout: [], logs: [], ...answers.get(title) }
     }
 
-    const result = await replay(outDir, fakeRunner({}, []), qaDir, slow, () => clock.now, 0)
+    const result = await replay(outDir, fakeRunner({}, []), qaDir, slow, () => clock.now, ninetyMinuteLeg)
 
-    // Runs end by minute 88, 2 minutes before the job's timeout. a-stuck gets no extra run, since b-bug and c-late are
-    // owed theirs. c-late's first run would end at minute 90: counted from the replay step, it would have started.
+    // a-stuck gets no extra run, since b-bug and c-late are owed theirs; c-late's first run would end after the leg.
     expect(calls).toEqual([...Array(3).fill('stack control'), ...Array(3).fill('a-stuck'), ...Array(3).fill('b-bug')])
     expect(clock.now).toBe(82 * 60_000)
     expect(titles(result.confirmed)).toEqual(['b-bug'])
-    const outOfTime = "out of time: another run might not end before the leg's 90-minute timeout"
     expect(result.flaky.map(({ id, replay }) => [id, replay])).toEqual([
       ['a-stuck', { failed: 0, runs: 0, inconclusive: 3, reason: outOfTime }],
       ['c-late', { failed: 0, runs: 0, reason: outOfTime }],
+    ])
+  })
+
+  test("the leg's cold first run does not size the rest, so a bug that fails every run still gets its 3", async () => {
+    // The first control run starts Maestro's driver and the app on a cold simulator.
+    const seconds = new Map([
+      ['stack control', [539, 277, 280]],
+      ['a-code', [274, 241, 190]],
+      ['b-back', [277, 168, 166]],
+      ['c-name', [241, 180, 195, 195]],
+      ['d-picker', [350, 291, 266]],
+    ])
+    const clock = { now: 381_000 }
+    // c-name's first run stops before the name field.
+    const early = { passed: false, error: 'Assertion is false: "What should we call you?" is visible' }
+    const seen = { layout: ['[qa-layout] ready', nameLine] }
+    for (const title of [...seconds.keys()].slice(1)) await writeNative(makeNative(title, layout))
+    const calls: string[] = []
+    const timed: RunFlow = async (yaml) => {
+      const title = /assertVisible: "?([^"\n]+)/.exec(yaml)?.[1] ?? ''
+      const first = !calls.includes(title)
+      calls.push(title)
+      clock.now += (seconds.get(title)?.shift() ?? 0) * 1000
+      return { passed: true, layout: [], logs: [], ...(title === 'c-name' && first ? early : seen) }
+    }
+
+    const result = await replay(outDir, fakeRunner({}, []), qaDir, timed, () => clock.now, ninetyMinuteLeg)
+
+    expect(result.flaky).toEqual([])
+    expect(result.confirmed.map(({ id, replay }) => [id, replay.runs, replay.inconclusive ?? 0])).toEqual([
+      ['a-code', 3, 0],
+      ['b-back', 3, 0],
+      ['c-name', 3, 1],
+      ['d-picker', 3, 0],
+    ])
+    expect(clock.now).toBe(4_511_000)
+  })
+
+  test("a slow warm control run still sizes the leg, and a driver retry's wait stays free", async () => {
+    // The 600 s run would end in time only by eating the time a retried driver start may take.
+    const seconds = [100, 600, 100]
+    const clock = { now: 3_780_000 }
+    await writeNative(makeNative('late', layout))
+    const calls: string[] = []
+    const timed: RunFlow = async (yaml) => {
+      calls.push(/assertVisible: "?([^"\n]+)/.exec(yaml)?.[1] ?? '')
+      clock.now += (seconds.shift() ?? 0) * 1000
+      return { passed: true, layout: [nameLine], logs: [] }
+    }
+
+    const result = await replay(outDir, fakeRunner({}, []), qaDir, timed, () => clock.now, ninetyMinuteLeg)
+
+    expect(calls).toEqual(Array(3).fill('stack control'))
+    expect(result.flaky.map(({ id, replay }) => [id, replay])).toEqual([
+      ['late', { failed: 0, runs: 0, reason: outOfTime }],
     ])
   })
 
@@ -1439,7 +1468,7 @@ describe('native fix verification', () => {
   const timeout = { passed: false, error: 'iOS driver not ready in time' }
   const failed = { passed: false, error: 'Assertion is false: "Continue" is visible' }
 
-  /** A device answering each run with the next queued result (a clean pass once none is left), recording the runs. */
+  /** Each run takes the next queued result; none left is a clean pass. */
   const device = (results: Partial<FlowRun>[], runs: number[] = []): RunFlow => {
     const queue = [...results]
     return async (_yaml, _outDir, run) => {
@@ -1789,7 +1818,7 @@ describe('judge', () => {
 
   test('an image counts toward the judge spend ceiling', async () => {
     expect(worstJudgeCost('s', 'u', 1) - worstJudgeCost('s', 'u', 0)).toBeCloseTo((1_600 * 4) / 1_000_000)
-    // Text that fits under the $2 ceiling with 800 input tokens to spare, so only the image's 1,600 push it over.
+    // Text that fits under the ceiling with room to spare, so only the image pushes it over.
     const base = makeVisual('tight')
     const room = (2 - (4096 * 20) / 1_000_000) / (4 / 1_000_000) - 1_000 - 26 - 800
     const pad = room - JSON.stringify(base, null, 2).length - '<finding>\n\n</finding>'.length
@@ -1930,7 +1959,7 @@ describe('judge', () => {
       observations: [],
       dropped: [],
     })
-    // 600,000 bytes may be up to 600,000 input tokens: $2.40 at $4 per million, over the $2 ceiling.
+    // A byte may cost an input token, so this file alone is over the ceiling.
     await Bun.write(join(outDir, 'c2-chat-desktop/repro/huge.spec.ts'), 'x'.repeat(600_000))
     const calls: Anthropic.MessageCreateParamsNonStreaming[] = []
 
