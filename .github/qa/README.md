@@ -204,7 +204,9 @@ code from. The fallback is a checkout the job's user cannot write during replay.
    `replay.reason` saying how many runs failed early, unless the runs that reached the step confirm it anyway (2
    failures for a real-AI charter). A spec that puts its sign-in inside the step still passes this check; the judge
    is the backstop there. The control spec has no such step, so any failure of it counts.
-   Otherwise 3 of 3 failures confirm a finding, 2 of 3 for the real-AI charters (`realAiCharters` in `findings.ts`);
+   Otherwise 3 of 3 failures confirm a finding, 2 of 3 for the real-AI charters (`realAiCharters` in `findings.ts`)
+   and for a `layout` finding proved by a native flow, whose measurements vary with the keyboard animation's timing
+   (a browser spec, c7's on Android included, keeps 3 of 3);
    1 or 2 are flaky (report only), 0 is dropped. c7 replays on Postgres + PowerSync, the real-AI charters against
    the real providers, the rest on pglite with the fake AI. A `visual` finding skips the lint and Playwright and
    takes no place under the replay cap. It is confirmed when its screenshot exists, a browser screenshot result in
@@ -226,7 +228,8 @@ code from. The fallback is a checkout the job's user cannot write during replay.
    hidden, foreign links removed). A run whose driver did not start (`iOS driver not ready in time`) is run once more and never counts as the
    bug. A `layout` or log-oracle run whose flow failed before the quoted line showed never reached the screen: it is
    inconclusive and run again, at most 3 extra runs per finding. The finding is confirmed when the line shows in 3 of
-   3 conclusive runs (2 of 3 for the real-AI charters), and flaky when fewer than 3 runs are conclusive after the
+   3 conclusive runs (2 of 3 for the real-AI charters and for a `layout` oracle, whose measurements vary with the
+   keyboard animation's timing), and flaky when fewer than 3 runs are conclusive after the
    extra runs. A run whose flow passed without the line still counts as not shown. For the other oracles, where a
    failed flow is the bug, the flow's last command that is not `waitForAnimationToEnd` is the bug's assertion:
    everything before it runs first as its own `maestro test`, in the same launch, so a failure there is inconclusive
@@ -256,14 +259,27 @@ code from. The fallback is a checkout the job's user cannot write during replay.
    `visual` finding is judged on its screenshot, a native one on the flow replay ran (the allow list's own
    serialization, read from a path checked like a screenshot's). For a `layout` finding the replayed probe
    line is the proof and a screenshot only context. The default answer is drop. The judge also proposes the
-   ticket's priority from a four-line rubric in `judge.md`. Writes `verified.json`.
-5. **file** (`file-findings.ts`): fingerprint dedupe, severity, ticket caps and roll-ups, secret refusal.
+   ticket's priority from a four-line rubric in `judge.md`. When the kept findings carry two distinct fingerprints or more, one more
+   call with the same model groups them by defect (`groupFindings`), because each platform can word one bug
+   differently: Android names an icon button by the text before it where the web and iOS also name the icon, and
+   a field the keyboard hides is `behind-keyboard` on Android but `focused-clipped` on iOS. That call sees each
+   finding's title, area, platform, oracle and screenshot path, fenced as untrusted data, and counts against the
+   judge's spend ceiling and `judge_usage`. Code checks the answer: every confirmed finding in exactly one group,
+   one area per group, and findings that share a fingerprint kept together. Only an answer that passes goes into
+   `verified.json` as `groups`. A malformed answer, a failed check, an API error or too little room under the
+   ceiling logs why and leaves the whole run to fingerprint grouping. Writes `verified.json`.
+5. **file** (`file-findings.ts`): grouping and dedupe, severity, ticket caps and roll-ups, secret refusal.
    A table keyed on area and oracle type gives each finding a starting severity. The judge's priority may move it
    one level up or down, but a console error or an overflow never goes above Medium. A missing or unknown
-   priority keeps the table's value. Findings that share a fingerprint file with the highest severity among them.
-   Dry run unless `--live`. The fingerprint ignores the platform, so findings that share one become one ticket
-   whose `**Platforms:**` line lists every platform that found the bug, and an open ticket gets one comment with
-   that line. A `visual` finding's fingerprint is its area, function and element (`<role> "<name>"`), never its
+   priority keeps the table's value. Dry run unless `--live`. Each group in `verified.json` becomes one ticket;
+   without `groups`, findings that share a fingerprint do (the fingerprint ignores the platform). The ticket
+   files with the highest severity among its findings, its `**Platforms:**` line lists every platform that found
+   the bug, and an open ticket gets one comment with that line. The ticket text comes from the group's most severe
+   finding (ties go by fingerprint), and it lists each other member whose fingerprint differs, with its platform,
+   title and evidence. A secret in any member holds back the whole ticket. A group's ticket carries the fingerprint
+   of its first finding in `platforms.json` order, then by fingerprint. Nothing about groups is stored across weeks, so
+   the same findings land on the same `[qa:<fp>]` ticket every week, and a group that loses its first-platform
+   finding moves to another member's fingerprint. A `visual` finding's fingerprint is its area, function and element (`<role> "<name>"`), never its
    wording; one without an element or a function is refused. Its ticket names the element and embeds the screenshot, uploaded with the content type its bytes declare. A `security` finding uploads no screenshot and no video.
    An Android `layout` finding of the `covered` kind is refused too, with its reason in the report, until the probe
    has swept correct Android screens clean (see "Known limits"). It still replays and is judged, and an iOS finding
@@ -799,7 +815,7 @@ workspace's spend limit bounds what a leaked key can cost, and auto-fix stays of
 Caps live in one place per step type: the `env` block at the top of `qa-weekly.yml` for explore and fix (budget,
 turns, timeout), and the constants at the top of `verify.ts` for the judge. The first values are generous on
 purpose: explore $10 / 400 turns / 60 min, fix $20 / 200 turns / 60 min. Per leg, at most 20 findings are replayed
-(4 on a native leg, whose runs are slow) and 15 judged, and a judge leg spends at most $2 (a call is admitted only if its worst case fits: prompt bytes,
+(4 on a native leg, whose runs are slow) and 15 judged, and a judge leg spends at most $2, its grouping call included (a call is admitted only if its worst case fits: prompt bytes,
 1,600 tokens per screenshot, plus `max_tokens`, at Opus prices). Findings over a cap are listed as deferred and
 never filed. The app's own provider calls in real-AI sessions are not measured: watch the QA provider keys'
 dashboards.
@@ -963,7 +979,8 @@ Also:
   iOS tree cannot tell a field from text, so an unnamed checkbox right after a filled field quotes what was typed
   there. The tree has no icons, no `data-testid` and no `name`, and iOS gives no page ids, so a control without an
   `id` can quote differently there than in the probe, and a web finding about it and a tree finding about it get
-  different fingerprints. Two unnamed controls with no text between them share one line on the tree. So that one
+  different fingerprints, which only the judge's grouping call can join into one ticket. Two unnamed controls with
+  no text between them share one line on the tree. So that one
   control never makes two findings on one platform, the gate and the replay drop the probe's own `unnamed-control`
   lines for what the tree reports (`keepsProbeLine` in `native-layout.ts`): on Android the roles the tree maps
   (button, checkbox, radio, switch, textbox, combobox, and searchbox, which the WebView shows as a text field), and

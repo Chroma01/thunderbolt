@@ -13,6 +13,7 @@ import type { TranscriptMessage } from './report'
 import { checkMaestroFlow } from './maestro-flow'
 import { measureNative, parseInspectScreen } from '../native-layout'
 import {
+  groupFindings,
   judge,
   legStartOf,
   nativeJobMinutes,
@@ -295,6 +296,34 @@ describe('replay', () => {
     expect(titles(result.confirmed)).toEqual(['always', 'twice'])
     expect(titles(result.flaky)).toEqual(['fake-twice', 'once'])
     expect(droppedAt(result, 'replay').map((entry) => entry.file.id)).toEqual(['never'])
+  })
+
+  test('a layout finding on a web viewport still needs 3/3 failures: only native layout measurements vary', async () => {
+    const evidence = '[qa-layout] covered button "Continue"'
+    await writeFinding(makeFinding('layout', { type: 'layout', evidence }))
+    const runner = fakeRunner({ 'c2-chat-desktop/repro/layout.spec.ts': ['failed', 'passed', 'failed'] }, [])
+
+    const result = await replay(outDir, runner, qaDir)
+
+    expect(titles(result.flaky)).toEqual(['layout'])
+    expect(result.confirmed).toEqual([])
+  })
+
+  test('c7 on Android keeps 3/3 for a layout finding proved by a browser spec, as the measurement is not a native one', async () => {
+    const session = 'c7-two-devices-android'
+    const finding = {
+      ...makeFinding('layout', { type: 'layout', evidence: '[qa-layout] covered button "Continue"' }),
+      charter: 'c7-two-devices',
+      viewport: 'android',
+    }
+    await Bun.write(join(outDir, session, 'findings', 'layout.json'), JSON.stringify(finding))
+    await Bun.write(join(outDir, session, finding.repro_spec), validSpec('layout'))
+    const runner = fakeRunner({ [`${session}/repro/layout.spec.ts`]: ['failed', 'passed', 'failed'] }, [])
+
+    const result = await replay(outDir, runner, qaDir)
+
+    expect(titles(result.flaky)).toEqual(['layout'])
+    expect(result.confirmed).toEqual([])
   })
 
   test('replays at most 20 findings and defers the rest, in path order', async () => {
@@ -849,6 +878,56 @@ describe('replay of native flows', () => {
     ])
   })
 
+  test('a native layout finding confirms at 2/3 failures and is flaky at 1/3, other native oracles still need 3/3', async () => {
+    const onboarding = 'c1-first-run-ios'
+    const title = 'Name field on onboarding is cut off when the keyboard opens'
+    const keyboardFinding: RawFinding = {
+      title,
+      area: 'onboarding',
+      charter: 'c1-first-run',
+      viewport: 'ios',
+      oracle: layout,
+      steps: ['Sign in with fresh address', 'Tick checkbox, Continue', 'Skip Connect Google', 'Name step opens'],
+      expected: 'Name field fully visible above the keyboard',
+      actual: 'The name field is cut in half by the button bar floating above the keyboard',
+      repro_flow: 'repro/keyboard.yaml',
+    }
+    await writeNative(keyboardFinding, null, onboarding)
+    await Bun.write(join(outDir, onboarding, 'repro/keyboard.yaml'), flowOf(title))
+    await writeNative(makeNative('once', layout))
+    await writeNative(makeNative('assert', assertFailed))
+    // A real-AI session confirms any oracle at 2 of 3.
+    await writeNative(
+      { ...makeNative('real', assertFailed), viewport: 'android' },
+      undefined,
+      'c3-models-providers-android',
+    )
+    const seen = { layout: ['[qa-layout] ready', nameLine] }
+    const unseen = { layout: ['[qa-layout] ready'] }
+    const failed = { passed: false, error: 'Assertion is false: "assert" is visible' }
+
+    const result = await nativeReplay({
+      [title]: [seen, unseen, seen],
+      once: [unseen, seen, unseen],
+      assert: [failed, {}, failed],
+      real: [
+        { ...failed, error: 'Assertion is false: "real" is visible' },
+        {},
+        { ...failed, error: 'Assertion is false: "real" is visible' },
+      ],
+    })
+
+    const counts = ({ id, replay: { failed, runs } }: VerifiedFinding) => [id, failed, runs]
+    expect(result.confirmed.map(counts)).toEqual([
+      [title, 2, 3],
+      ['real', 2, 3],
+    ])
+    expect(result.flaky.map(counts)).toEqual([
+      ['assert', 2, 3],
+      ['once', 1, 3],
+    ])
+  })
+
   test('an unnamed button the run passes, like the onboarding Back arrow, never confirms another one', async () => {
     // The Connect Google step has a Back arrow and a Continue button without a name.
     const step = await Bun.file(join(import.meta.dir, '../fixtures/native/inspect-android-onboarding.json')).text()
@@ -972,9 +1051,7 @@ describe('replay of native flows', () => {
     const unseen = { layout: ['[qa-layout] ready'] }
     for (const title of ['run5', 'stuck', 'passing'])
       await writeNative(makeNative(title, layout), undefined, 'c1-first-run-ios')
-    // An Android real-AI session confirms on 2 of 3 conclusive runs.
-    const real = 'c3-models-providers-android'
-    await writeNative({ ...makeNative('real', layout), viewport: 'android' }, undefined, real)
+    await writeNative(makeNative('after', layout), undefined, 'c1-first-run-ios')
     // A run that fails after the probe logged the line still shows the bug.
     const seenThenFailed = { ...early, layout: [nameLine] }
     const calls: FlowCall[] = []
@@ -983,8 +1060,8 @@ describe('replay of native flows', () => {
       {
         run5: [early, seen, early, seen, seen],
         stuck: [early, early, seen, early, seen, early, seen],
-        passing: [unseen, seen, seen],
-        real: [early, seen, unseen, seenThenFailed],
+        passing: [unseen, seen, unseen],
+        after: [early, seen, unseen, seenThenFailed],
       },
       calls,
     )
@@ -996,12 +1073,12 @@ describe('replay of native flows', () => {
       replay.inconclusive ?? 0,
     ]
     expect(result.confirmed.map(counts)).toEqual([
+      ['after', 2, 3, 1],
       ['run5', 3, 3, 2],
-      ['real', 2, 3, 1],
     ])
     // Still only two conclusive: flaky, whatever those two showed. A passed run without the line is not run again.
     expect(result.flaky.map(counts)).toEqual([
-      ['passing', 2, 3, 0],
+      ['passing', 1, 3, 0],
       ['stuck', 2, 2, 4],
     ])
     expect(result.flaky.find(({ id }) => id === 'stuck')?.replay.reason).toBe('only 2 of 3 runs reached the screen')
@@ -2013,5 +2090,169 @@ describe('judge', () => {
     const empty = await judge(outDir, fakeCreate({}, calls), qaDir)
     expect(calls).toHaveLength(0)
     expect(empty.judge_usage).toEqual({ input_tokens: 0, output_tokens: 0, cost_usd: 0 })
+  })
+
+  /** Judges with `judgeCreate` and answers the grouping call, the one whose prompt holds `<findings>`, with `groups`. */
+  const withGrouping =
+    (groups: string, judgeCreate: CreateMessage, groupingCalls: Anthropic.MessageCreateParamsNonStreaming[]) =>
+    async (params: Anthropic.MessageCreateParamsNonStreaming) => {
+      if (!String(params.messages[0].content).startsWith('<findings>')) return judgeCreate(params)
+      groupingCalls.push(params)
+      return {
+        content: [{ type: 'text' as const, text: groups, citations: null }],
+        stop_reason: 'end_turn' as const,
+        usage: { input_tokens: 500, output_tokens: 50 },
+      }
+    }
+  /** A candidate with other evidence, so its fingerprint differs from every `candidate`'s. */
+  const reworded = (title: string) => ({
+    ...candidate(title),
+    finding: makeFinding(title, { type: 'page-error', evidence: 'TypeError: reply is undefined' }),
+  })
+
+  test('groups only what the judge kept, in one more call counted in judge_usage', async () => {
+    await writeCandidates({
+      confirmed: [candidate('real'), reworded('twin'), candidate('intended')],
+      flaky: [],
+      observations: [],
+      dropped: [],
+    })
+    const keep = '{"keep":true,"reason":"Sending fails."}'
+    const judgeCreate = fakeCreate({ real: keep, twin: keep, intended: '{"keep":false,"reason":"Intended."}' }, [])
+    const groupingCalls: Anthropic.MessageCreateParamsNonStreaming[] = []
+    const groups = [['c2-chat-desktop/real', 'c2-chat-desktop/twin']]
+
+    const result = await judge(outDir, withGrouping(JSON.stringify({ groups }), judgeCreate, groupingCalls), qaDir)
+
+    expect(groupingCalls).toHaveLength(1)
+    const prompt = String(groupingCalls[0].messages[0].content)
+    expect(prompt).toContain('"id": "c2-chat-desktop/twin"')
+    expect(prompt).not.toContain('intended')
+    expect(result.groups).toEqual(groups)
+    expect(result.judge_usage).toEqual({ input_tokens: 3500, output_tokens: 800, cost_usd: 0.03 })
+    expect((await Bun.file(join(outDir, 'verified.json')).json()).groups).toEqual(groups)
+  })
+
+  test("the grouping call counts against the judge's spend ceiling", async () => {
+    await writeCandidates({
+      confirmed: [candidate('big'), reworded('large')],
+      flaky: [],
+      observations: [],
+      dropped: [],
+    })
+    // Both judge calls fit under the $2 ceiling, and what they leave is less than any call's worst case.
+    for (const title of ['big', 'large']) {
+      await Bun.write(join(outDir, `c2-chat-desktop/repro/${title}.spec.ts`), 'x'.repeat(220_000))
+    }
+    const keep = '{"keep":true,"reason":"Sending fails."}'
+    const groupingCalls: Anthropic.MessageCreateParamsNonStreaming[] = []
+    const lines: string[] = []
+    const answer = JSON.stringify({ groups: [['c2-chat-desktop/big', 'c2-chat-desktop/large']] })
+
+    const create = withGrouping(answer, fakeCreate({ big: keep, large: keep }, []), groupingCalls)
+    const result = await judge(outDir, create, qaDir, (line) => lines.push(line))
+
+    expect(result.confirmed).toHaveLength(2)
+    expect(groupingCalls).toEqual([])
+    expect(result.groups).toBeUndefined()
+    expect(lines).toEqual(["grouping: over the judge's spend ceiling of $2; findings file grouped by fingerprint"])
+  })
+})
+
+describe('grouping', () => {
+  /** Confirmed findings of a real run: one sign-in code field and one onboarding back button, on several platforms. */
+  const backButton = ['c1-first-run-desktop/2', 'c1-first-run-phone/2', 'c1-first-run-ios/2', 'c1-first-run-android/1']
+  const codeField = ['c1-first-run-desktop/1', 'c1-first-run-phone/1', 'c1-first-run-ios/1']
+  const findings = async () => {
+    const fixture: Verified = await Bun.file(join(import.meta.dir, '../fixtures/grouping/verified.json')).json()
+    return fixture.confirmed.filter((v) => [...backButton, ...codeField].includes(`${v.charterDir}/${v.id}`))
+  }
+  const answer =
+    (text: string, calls: Anthropic.MessageCreateParamsNonStreaming[] = []): CreateMessage =>
+    async (params) => {
+      calls.push(params)
+      return {
+        content: [{ type: 'text', text, citations: null }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 500, output_tokens: 50 },
+      }
+    }
+  const reply = (...groups: string[][]) => JSON.stringify({ groups })
+
+  test('keeps a valid answer, asked with the findings fenced as data', async () => {
+    const calls: Anthropic.MessageCreateParamsNonStreaming[] = []
+    const groups = [backButton, codeField]
+    const lines: string[] = []
+
+    const result = await groupFindings(await findings(), answer(reply(...groups), calls), 2, (line) => lines.push(line))
+
+    expect(result).toEqual({ groups, usage: { input_tokens: 500, output_tokens: 50 } })
+    expect(lines).toEqual([])
+    expect(calls[0].model).toBe('claude-opus-5-5')
+    expect(calls[0].output_config?.format?.schema).toMatchObject({ required: ['groups'] })
+    const prompt = String(calls[0].messages[0].content)
+    expect(prompt).toStartWith('<findings>\n')
+    expect(prompt).toEndWith('\n</findings>')
+    expect(prompt).toContain('arrow-left icon after Connect Google')
+  })
+
+  const rejected: [string, string, string][] = [
+    [
+      'a reply that is not the requested JSON',
+      'Sure! {"groups": [',
+      'malformed grouping reply (stop_reason: end_turn)',
+    ],
+    ['a group that joins two areas', reply([...backButton, ...codeField]), 'a group joins the areas'],
+    [
+      'an id that is not a confirmed finding',
+      reply(backButton, codeField, ['c9/1']),
+      'an id that is not a confirmed finding',
+    ],
+    ['a finding left out', reply(backButton), 'a finding is missing or in two groups'],
+    ['a finding in two groups', reply(backButton, codeField, codeField.slice(0, 1)), 'in two groups'],
+    [
+      'findings that share a fingerprint split up',
+      reply(backButton, codeField.slice(0, 1), codeField.slice(1)),
+      'findings that share a fingerprint are split up',
+    ],
+  ]
+  for (const [name, text, reason] of rejected) {
+    test(`${name} leaves the whole run to fingerprints and says why`, async () => {
+      const lines: string[] = []
+
+      const result = await groupFindings(await findings(), answer(text), 2, (line) => lines.push(line))
+
+      expect(result).toEqual({ usage: { input_tokens: 500, output_tokens: 50 } })
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toStartWith('grouping: ')
+      expect(lines[0]).toContain(reason)
+      // The job log is public: it never repeats an id the model wrote.
+      expect(lines[0]).not.toContain('c9/1')
+    })
+  }
+
+  test('findings that all share one fingerprint make no call', async () => {
+    const calls: Anthropic.MessageCreateParamsNonStreaming[] = []
+    const lines: string[] = []
+    const sameField = (await findings()).filter((v) => codeField.includes(`${v.charterDir}/${v.id}`))
+
+    const result = await groupFindings(sameField, answer(reply(codeField), calls), 2, (line) => lines.push(line))
+
+    expect(sameField).toHaveLength(3)
+    expect(calls).toEqual([])
+    expect(result).toEqual({ usage: { input_tokens: 0, output_tokens: 0 } })
+    expect(lines).toEqual([])
+  })
+
+  test('an API error leaves the run to fingerprints and says why', async () => {
+    const lines: string[] = []
+    const overloaded: CreateMessage = async () => {
+      throw new Error('529 overloaded')
+    }
+
+    const result = await groupFindings(await findings(), overloaded, 2, (line) => lines.push(line))
+
+    expect(result).toEqual({ usage: { input_tokens: 0, output_tokens: 0 } })
+    expect(lines).toEqual(['grouping: the call failed: Error: 529 overloaded; findings file grouped by fingerprint'])
   })
 })
