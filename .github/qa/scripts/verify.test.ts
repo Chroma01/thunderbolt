@@ -1020,6 +1020,44 @@ describe('replay of native flows', () => {
     ])
   })
 
+  describe('a control run whose driver never started', () => {
+    const driver = { passed: false, error: 'Unable to launch app: iOS driver not ready in time' }
+    const failed = { passed: false, error: 'Assertion is false: "hello" is visible' }
+
+    test('is replaced, and the stack stays healthy once 3 runs counted', async () => {
+      await writeNative(makeNative('always', assertFailed))
+      const calls: FlowCall[] = []
+
+      // Both tries of the first run fail to start the driver; the next three runs pass.
+      const result = await nativeReplay({ 'stack control': [driver, driver], always: [failed, failed, failed] }, calls)
+
+      expect(calls.filter((call) => call.title === 'stack control')).toHaveLength(5)
+      expect(result.stack_unhealthy).toBeUndefined()
+      expect(result.confirmed.map(({ id, replay }) => [id, replay.failed, replay.runs])).toEqual([['always', 3, 3]])
+    })
+
+    test('never makes the stack healthy when no run counts: the control stops after its extra runs', async () => {
+      await writeNative(makeNative('always', assertFailed))
+      const calls: FlowCall[] = []
+
+      const result = await nativeReplay({ 'stack control': Array(12).fill(driver), always: [failed] }, calls)
+
+      expect(result.stack_unhealthy).toBe('control flow never completed 3 runs: only 0 of 3 runs reached the screen')
+      expect(calls.map((call) => call.title)).toEqual(Array(12).fill('stack control'))
+      expect(result.confirmed).toEqual([])
+      expect(result.dropped.map((entry) => [entry.file.id, entry.reason])).toEqual([['always', 'stack unhealthy']])
+    })
+
+    test('does not hide another failure in the same control: it still marks the stack unhealthy', async () => {
+      await writeNative(makeNative('always', assertFailed))
+
+      const result = await nativeReplay({ 'stack control': [driver, driver, failed], always: [failed] })
+
+      expect(result.stack_unhealthy).toBe(`control flow failed 1/3 runs: ${failed.error}`)
+      expect(result.confirmed).toEqual([])
+    })
+  })
+
   test('a log oracle fails a run when a new log line holds the evidence, whatever the run-specific noise', async () => {
     const line = (time: string, pid: string, hash: string, chat: string) =>
       `webview: 2026-10-19 ${time} Df Thunderbolt Dev[${pid}] [com.apple.WebKit:Generic] WebContent[49912] ` +
@@ -1511,6 +1549,26 @@ describe('replay of native flows', () => {
     expect(result.flaky.map(({ id, replay }) => [id, replay])).toEqual([
       ['late', { failed: 0, runs: 0, reason: outOfTime }],
     ])
+  })
+
+  test("a control's replacement run starts only while the findings' base runs still fit the leg", async () => {
+    const clock = { now: 60 * 60_000 }
+    await writeNative(makeNative('late', layout))
+    const calls: string[] = []
+    // The control's first run fails to start its driver on both launches; every call takes 5 minutes.
+    const slow: RunFlow = async (yaml) => {
+      calls.push(/assertVisible: "?([^"\n]+)/.exec(yaml)?.[1] ?? '')
+      clock.now += 5 * 60_000
+      if (calls.length <= 2) return { passed: false, error: 'iOS driver not ready in time', layout: [], logs: [] }
+      return { passed: true, layout: [nameLine], logs: [] }
+    }
+
+    const result = await replay(outDir, fakeRunner({}, []), qaDir, slow, () => clock.now, ninetyMinuteLeg)
+
+    // Two counted runs, and a third would leave no room for the finding's 3.
+    expect(calls).toEqual(Array(4).fill('stack control'))
+    expect(result.stack_unhealthy).toBe(`control flow never completed 3 runs: ${outOfTime}`)
+    expect(result.dropped.map((entry) => [entry.file.id, entry.reason])).toEqual([['late', 'stack unhealthy']])
   })
 
   test('the leg starts when the command does unless the job recorded its start, and a bad start is refused', () => {

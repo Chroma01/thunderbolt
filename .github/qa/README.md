@@ -65,7 +65,10 @@ forge a verdict. The fix job's own verdicts (the spec replay, the visual check's
 agent's checkout, whose `node_modules` its test runs could rewrite and `publish` does not check. The most a forged
 verdict does is open a draft PR, which a person reviews.
 
-Only the `build` job saves caches, because it runs before any untrusted code. `build-native` also runs before it.
+Only `build` and `cache-system-image` save caches, because they run before any untrusted code. Every other job only
+restores them with `actions/cache/restore`, `native-control` included, so code a model wrote never fills a cache a
+later run trusts. `setup-bun` runs with `no-cache: true`: its own cache save is a post step, after the job's steps,
+which in most jobs include model-written code.
 The judge runs in a fresh job, because the replayed specs may have changed files in the replay job's checkout.
 
 The browser tools can write files anywhere in the explore job's checkout, so no repo code runs there after the
@@ -218,7 +221,9 @@ code from. The fallback is a checkout the job's user cannot write during replay.
    `viewport`. The flow passes the gate's allow list with `${EMAIL}` as its only variable, and
    `verify.ts replay --native` runs it 3 times through `replay-native.ts`, each time on a fresh install (the
    onboarding build for c1, the plain one otherwise), with a video under `<out>/videos/`. `control/stack.yaml` runs 3
-   times first on the plain build; one failure marks the stack unhealthy and no flow runs. On Android the install also maps the stack's ports into the
+   times first on the plain build; one failure marks the stack unhealthy and no flow runs. A control run whose iOS driver did not
+   start, even on its retry, is inconclusive and replaced like a finding's run, up to 3 extra runs; a control left with fewer than 3
+   counted runs also marks the stack unhealthy. On Android the install also maps the stack's ports into the
    emulator again and warms the app up (as `native.sh install` does). Each run ends with one `maestro hierarchy` of the screen it stopped on, for the tree's
    `unnamed-control` lines and, on Android, its `behind-keyboard` line; a screen the run only passed through, like
    the privacy step the harness clicks through, adds no tree line.
@@ -624,6 +629,12 @@ Android on `ubuntu-latest` with KVM.
 - **build-native**, one job per platform of the run, before any untrusted code: `native.sh build` with onboarding
   off and on, uploaded as `qa-native-<platform>` and `qa-native-<platform>-onboarding`. Each artifact is a tar of
   the app, because an artifact drops file modes.
+- **cache-system-image**, when the run builds Android, beside build-native and before any untrusted code: downloads
+  the emulator's system image (1.9 GB from Google) with `native.sh system-image` and saves it as a cache, unless the
+  cache already has it. `explore-native` waits for it, and every job that boots an Android device restores that
+  cache before its own `native.sh system-image`, which then finds the image installed. `native.sh system-image`
+  retries a failed install once, after deleting what the failed download left behind, because a download can arrive
+  corrupt. A failed download saves nothing and fails nothing: each Android job then downloads the image itself.
 - **explore-native**, one job per native session: Maestro 2.11.0 from the official installer on both platforms,
   Claude Code 2.1.303, the app the session needs (the onboarding build for c1), the device, `stack.sh start native`
   and the console stream (on iOS started right after the device, on Android after the install). `c7-two-devices-android` also gets Postgres, PowerSync, the web build on 1424 by default
@@ -640,7 +651,9 @@ Android on `ubuntu-latest` with KVM.
   with `--leg`, which goes into each video's name so merged legs never overwrite one another. A run takes about
   4 minutes on iOS, so a native leg replays at most 4 findings (`nativeReplayCap`): the control's
   3 runs and up to 6 runs per finding, plus setup, wrap-up and one driver retry, take about 122 minutes and fit the
-  130-minute job, whose timeout would lose every finding. Every native leg shares that timeout, and the job ends
+  130-minute job, whose timeout would lose every finding. The control's own extra runs, which replace one whose iOS
+  driver never started, start only while every finding's 3 base runs still fit, so the leg still ends inside the
+  timeout and a later finding keeps its base runs. Every native leg shares that timeout, and the job ends
   when its runs do. Runs can be slower than that, and Android's setup differs from iOS's, so the job's first step
   records `QA_LEG_START` and `verify.ts` starts no run that might end after the timeout: see the replay step above.
   On Android, before the console stream starts, one Maestro session that counts for nothing installs the plain build
