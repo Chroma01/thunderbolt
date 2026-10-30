@@ -54,9 +54,9 @@ concurrency:
 permissions: {}
 
 env:
-  QA_EXPLORE_MAX_BUDGET_USD: 10
-  QA_EXPLORE_MAX_TURNS: 400
-  QA_EXPLORE_TIMEOUT_MINUTES: 60
+  QA_EXPLORE_MAX_BUDGET_USD: 4.01
+  QA_EXPLORE_MAX_TURNS: 552
+  QA_EXPLORE_TIMEOUT_MINUTES: 63
   QA_FIX_MAX_BUDGET_USD: 20
   QA_FIX_MAX_TURNS: 200
   QA_FIX_TIMEOUT_MINUTES: 60
@@ -869,7 +869,7 @@ jobs:
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.build.outputs.nativeVerify != '[]' }}
     runs-on: ${{ matrix.leg.runner }}
     # Only a ceiling: a timeout loses every finding of the leg, so verify.ts starts no run that could end after it.
-    timeout-minutes: 130
+    timeout-minutes: 360
     environment: ${{ matrix.leg.real && 'qa-agent' || '' }}
     permissions:
       contents: read
@@ -947,7 +947,8 @@ jobs:
             --app "$RUNNER_TEMP/apps/plain/$QA_APP_FILE" --app-onboarding "$RUNNER_TEMP/apps/onboarding/$QA_APP_FILE" \
             --leg "$LEG"
 
-      # Read after the replay, not streamed: an adb reset ends a stream. The log buffer is grown at boot to hold a leg.
+      # Read after the replay, not streamed: an adb reset ends a stream. The log buffer is grown at boot to hold
+      # a 6-hour leg.
       - name: Save the emulator's, adb's and Maestro's logs
         if: always() && matrix.leg.platform == 'android' && !matrix.leg.real
         run: |
@@ -1102,7 +1103,9 @@ jobs:
             # Web real-AI tasks, checked again on the real providers by verify-real. Android's run in verify-native.
             echo "real=$(jq --compact-output '[.fixes[] | select(.real and .spec != null)]' qa-out/fix-plan.json)"
           } >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # Also when filing failed: filed.json then lists the tickets that did reach Linear and the attachments lost.
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qa-filed
           path: |

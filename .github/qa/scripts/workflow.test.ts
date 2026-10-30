@@ -9,7 +9,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  extraRuns,
   nativeDriverStartupMinutes,
   nativeJobMinutes,
   nativeReplayCap,
@@ -153,6 +152,11 @@ describe('native explore', () => {
     expect(keyed.map(label)).toEqual(['Check the session output for secrets'])
     for (const s of keyed) expect(s.run ?? '').not.toMatch(/bun |\.github\/|explore\.sh/)
   })
+})
+
+test('filed.json is uploaded even when filing fails, so the report lists the tickets that reached Linear', () => {
+  const upload = steps('file').find((s) => s.with?.name === 'qa-filed')
+  expect(upload?.if).toBe('always()')
 })
 
 describe('fix job', () => {
@@ -356,10 +360,10 @@ describe('publish', () => {
   })
 })
 
-test("a native replay leg's worst case fits its timeout, since a timeout loses every finding of the leg", () => {
-  // The control's 3 runs and every finding's 3 plus extras. The control's own extras are left out: they start only
-  // while the findings' base runs still fit the clock.
-  const runs = 3 + nativeReplayCap * (3 + extraRuns)
+test("a native replay leg's base runs fit its timeout, since a timeout loses every finding of the leg", () => {
+  // The control's 3 runs and every finding's 3. Extra runs are left out: one starts only while the base runs of
+  // every later finding still fit the clock.
+  const runs = 3 + nativeReplayCap * 3
   const minutes =
     runs * nativeRunEstimateMinutes + nativeSetupEstimateMinutes + nativeWrapUpMinutes + nativeDriverStartupMinutes
   expect(minutes).toBeLessThan(nativeJobMinutes)
@@ -367,6 +371,12 @@ test("a native replay leg's worst case fits its timeout, since a timeout loses e
   expect(jobs['replay-native']['timeout-minutes']).toBe(nativeJobMinutes)
   // ...counted from the job's first step, so the setup before the replay step is on the clock.
   expect(steps('replay-native')[0].run).toBe('echo "QA_LEG_START=$(date +%s)" >> "$GITHUB_ENV"')
+})
+
+test("the iOS log stream outlasts a replay leg, since a run after it ends sees no line and can't prove a bug", () => {
+  const nativeSh = readFileSync(join(import.meta.dir, 'native.sh'), 'utf8')
+  const hours = Number(/log stream .* --timeout (\d+)h/.exec(nativeSh)?.[1])
+  expect(hours * 60).toBeGreaterThan(jobs['replay-native']['timeout-minutes'] ?? 0)
 })
 
 describe('native jobs', () => {
