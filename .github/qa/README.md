@@ -20,7 +20,7 @@ The explorer reads untrusted pages, so everything it writes is untrusted too. Ea
 | A: explore and verify    | `explore`, `explore-native` on Android, `replay`, `replay-native`, `judge` | the QA Anthropic key (explore, judge); QA provider keys in real-AI backends (other OS users)                                                                | Linear key, any write token. The replay steps hold no secret: they run model-written specs and flows |
 | B: file                  | `file`                                                                     | the Linear key                                                                                                                                              | an LLM, a browser                                                                                    |
 | C: fix                   | `fix`, then `publish`                                                      | `fix`: the QA Anthropic key, read-only token. `publish`: GitHub App token + Linear key                                                                      | `fix`: any provider key. `publish` runs no LLM and checks the patch in code                          |
-| D: native explore, macOS | `explore-native` on iOS                                                    | the QA Anthropic key, only in the `env:` of the canary, session and secret-scan steps                                                                       | any provider key, the Linear key, any write token, an agent that edits code                          |
+| D: native explore, macOS | `explore-native` on iOS                                                    | the QA Anthropic key, only in the `env:` of the session and secret-scan steps                                                                               | any provider key, the Linear key, any write token, an agent that edits code                          |
 | E: check a patch         | `verify-native-build`, `verify-native-run`, `verify-real`                  | nothing, except `verify-real`: QA provider keys in a backend that runs as another OS user, from a fresh checkout that serves the fix job's patched frontend | the Linear key, any write token, an LLM                                                              |
 
 Every confirmed finding goes to the fix agent, whatever its area, and a person reviews every draft PR. `publish`
@@ -39,7 +39,12 @@ included, can be changed. The repo is public, so a security fix's PR names only 
 "security": no finding text and no regression spec, which a person adds after the fix merges.
 
 In the fix job the dev servers reload the agent's edits outside its sandbox, so they run as the OS user `qa-dev`
-(`QA_BACKEND_USER` with `stack.sh start dev`). A step right after the start fails the job if a process of the job's
+(`QA_BACKEND_USER` with `stack.sh start dev`). That user cannot write to the checkout: `stack.sh start` makes it
+the owner of `node_modules/.vite` and `public/@powersync`, and every server it runs gets `CACHE_DIR` in its own
+home, where Storybook's Vite plugin keeps its cache. The `qa` job in `ci.yml` starts this dev stack as another user,
+loads both pages, stops it and fails on any `EACCES`, `EPERM` or "permission denied" in the stack log. It also runs
+when `vite.config.ts`, `scripts/copy-powersync-assets.ts`, `package.json` or `bun.lock` change, since a new plugin
+or version can write somewhere new. A step right after the start fails the job if a process of the job's
 user listens on 8005, 1424 or 1425 (`ss` names the owner only of the caller's own sockets), and `stack.sh lock` then
 takes root away before the agent starts. Code the servers reload cannot read the agent's environment, which holds
 the key. sudo makes itself unkillable by the job's user, so before the lock `stack.sh start` adds one sudoers rule
@@ -96,7 +101,7 @@ browser could write anywhere in the checkout. Only `c7-two-devices-android` gets
 - (c) Maestro's cloud tools, `list_devices` and `open_maestro_viewer` never reach the model: the gate does not offer
   them, and they are disallowed by name.
 - (d) No copy of the key in a file the job's user can read. In `explore-native` it lives only in the `env:` of the
-  canary step, the session step and the secret scan after the session, never interpolated in `run:` and never
+  session step and the secret scan after the session, never interpolated in `run:` and never
   written to `$GITHUB_ENV`. The scan runs once `claude` has exited, so the model can no longer act.
 - (e) Write only inside the session dir: the rule `Edit(//<session dir>/**)` and the hook (`scripts/native-hook.ts`),
   which resolves links before it compares paths.
@@ -109,26 +114,66 @@ none. The session dir is passed as a path without links, because the Edit rule d
 `/tmp/…` misses a rule on `/private/tmp/…`. The gate log (`<out>/<session>.gate.log`), the WebView log and the
 backend log stay outside the session dir, since the model can write anywhere inside it.
 
-Before any session, `explore.sh canary <session> <out>` runs a short `claude-haiku-5-5` session with the same
-settings (5 turns, $0.05). It asks for a `run` with `runScript` and a Write to `/tmp/qa-canary-outside.txt`, and
-passes only when the gate log shows the hook's `allow mcp__maestro__run` (so the hook runs on MCP calls too), the
-gate's `deny run`, the hook's `deny Write`, and the file does not exist. If it fails, no session runs. It prints the session's result line and never a tool result. The CLI stays pinned to
-`@anthropic-ai/claude-code@2.1.303`, which is the version tested for the hook, the scrub and the Edit rule; a new version
-has to pass the canary and the Edit rule again. iOS sessions use the fake AI only (no provider key on the Mac), and no
-agent that edits code runs there.
+Before any session, `explore.sh canary <session> <out>` checks the gate with no model and no key.
+`scripts/native-canary.ts` takes the place of `claude` in the session's own command: it builds the same config dir, so
+it reads the hook command from the same `settings.json` and the gate from the same `--mcp-config` file, then makes the
+two forbidden calls itself. It runs the hook as Claude Code does (the call as JSON on stdin; only exit code 2 blocks)
+for a Write to `/tmp/qa-canary-outside.txt`, and creates the file if the hook lets it through. It runs the hook for the
+`run` call too, and if that passes it sends `run` with `- runScript: canary.js` to the real gate over MCP stdio. The
+canary passes only when the gate log shows the hook's `allow mcp__maestro__run` (the hook let the run reach the gate),
+the gate's `deny run`, the hook's `deny Write`, and the file does not exist. A crash anywhere leaves a line missing, so
+it fails the same way. If it fails, no session runs. It differs from a session in one way: Claude Code itself does not
+run, so its own rules (`--tools`, `--disallowedTools`, the Edit rule) and its scrub of the hook's environment are not
+exercised here. The CLI stays pinned to `@anthropic-ai/claude-code@2.1.303`, the version tested for those, and nothing
+fails when the pin moves, so a bump needs the check below. iOS sessions use the fake AI only (no provider key on the
+Mac), and no agent that edits code runs there.
+
+Upgrading the Claude Code CLI: install the new version, then run two short sessions with `ANTHROPIC_API_KEY` set, from
+the repo root. The dry run prints the session's command, settings and env as JSON and starts nothing; `try` rebuilds
+that command in a fresh config dir with the hook command you give it and your own prompt. The session's tools are
+`Write` and the Maestro gate, so the Edit rule is tested through `Write`.
+
+```bash
+out=/tmp/qa-upgrade session=c2-chat-power-user-ios
+mkdir -p $out && touch $out/webview.log $out/backend.log
+export QA_DEVICE_ID=any QA_WEBVIEW_LOG=$out/webview.log QA_BACKEND_LOG=$out/backend.log
+QA_DRY_RUN=1 .github/qa/scripts/explore.sh run $session $out > $out/dry.json
+inside=$(cd $out && pwd -P)/$session/inside.txt
+prompt="Call the Maestro run tool with the yaml \`- tapOn: Continue\`. Use Write to create /tmp/qa-upgrade-outside.txt
+with the text canary. Use Write to create $inside with the text ok. Make all three calls, then stop."
+try() { # $1: the hook command, $2: the prompt
+  cfg=$(mktemp -d) && rm -f $out/$session.gate.log $inside /tmp/qa-upgrade-outside.txt
+  jq --arg c "$1" '.settings | .hooks.PreToolUse[0].hooks[0].command = $c' $out/dry.json > $cfg/settings.json
+  jq -j --arg cfg "$cfg" --arg p "$2" '.command | map(if startswith("CLAUDE_CONFIG_DIR=") then "CLAUDE_CONFIG_DIR=" + $cfg
+    else . end) | (index("-p") + 1) as $i | .[$i] = $p | .[] | ., "\u0000"' $out/dry.json |
+    env $(jq -r '.env | del(.QA_DRY_RUN) | to_entries[] | "\(.key)=\(.value)"' $out/dry.json) xargs -0 env > /dev/null
+  cat $out/$session.gate.log; ls $inside; test -e /tmp/qa-upgrade-outside.txt && echo "outside file EXISTS"
+}
+try "$(jq -r '.settings.hooks.PreToolUse[0].hooks[0].command' $out/dry.json)" "$prompt" # 1: the session's hook
+try "exit 0" "$prompt" # 2: no hook, the Edit rule alone
+```
+
+Run 1 must print, in any order, `allow mcp__maestro__run gated Maestro tool` (Claude Code calls the hook on MCP
+calls), `deny Write <resolved path> is outside the session dir` (the path with links resolved, so
+`/private/tmp/qa-upgrade-outside.txt` on macOS) and `allow Write inside the session dir`, then `inside.txt` and no
+"outside file EXISTS" line (the hook's exit code 2 stopped the write). Run 2 has no hook lines; it must print the
+gate's own `allow run` line, `inside.txt` (the rule still lets the session dir through) and again no "outside file
+EXISTS" line (the rule alone refused the path outside the session dir). The outside file is never created by hand, as
+the Write tool would refuse to overwrite an existing file anyway. Only then change the version here and in the
+workflow.
 
 In CI, nothing a native session runs comes from the checkout. On Android, c7's second browser can write anywhere in
 it while the key is in the environment, and the same steps run on every native leg. Before the canary,
-`explore.sh harness <session> <dir>` compiles the gate and the hook with `bun build --compile` into standalone
-binaries that read nothing from the checkout or `node_modules`, built with the `--no-compile-autoload-*` flags so
-they ignore a `bunfig.toml` (whose `preload` is code) or `.env` where they start. It copies `explore.sh` and, for
-c7, the layout probe, installs the second browser's MCP server there, and writes the session's MCP config pointing
+`explore.sh harness <session> <dir>` compiles the gate, the hook and the canary with `bun build --compile` into
+standalone binaries that read nothing from the checkout or `node_modules`, built with the `--no-compile-autoload-*`
+flags so they ignore a `bunfig.toml` (whose `preload` is code) or `.env` where they start. It copies `explore.sh` and,
+for c7, the layout probe, installs the second browser's MCP server there, and writes the session's MCP config pointing
 only at those files. The workflow makes the dir read-only and runs `<dir>/explore.sh canary` and `run` with
 `QA_HARNESS=<dir>`. In that mode `claude` starts in an empty temp dir, so neither it, the hook, the gate nor the
-browser's MCP server starts in the checkout, and `run` skips its summary, so no repo code runs in a step that holds
-the key after the session. The stream goes to `<out>/<session>.run.jsonl`, next to the gate log and outside the
-session dir the model can write to; the save step builds `execution.json` and `transcript.json` from it without
-the key, after the tripwire and the secret scan.
+browser's MCP server starts in the checkout, and `run` skips its summary, so no repo code runs in a step that holds the
+key after the session. The stream goes to `<out>/<session>.run.jsonl`, next to the gate log and outside the session dir
+the model can write to; the save step builds `execution.json` and `transcript.json` from it without the key, after the
+tripwire and the secret scan.
 
 ### Real-AI legs
 
@@ -306,31 +351,37 @@ code from. The fallback is a checkout the job's user cannot write during replay.
    task (`real`) is fixed on the fake AI, and `verify-real` runs its spec three times on the real providers against
    the patched frontend; all three must pass. A real-AI web visual task has no spec for `verify-real` to run, so
    `publish` never opens a PR for it: the ticket gets `Human Required`, like a fix that failed its checks. Any check
-   a task needs that did not succeed (failed, skipped or cancelled) leaves a diagnosis. An iOS or Android task carries its
-   Maestro `flow` instead of a spec: the agent writes the patch on Linux (reproducing the bug on the web at phone
-   size in `qa-out/fix-<fp>/repro/web.spec.ts` when it shows there), and a native visual task's check is
-   the Maestro flow `qa-out/fix-<fp>/repro/check.yaml`, which must end on an assertion. Without the patch only that
-   final assertion can show the defect; a step before it that fails makes the run inconclusive. `publish` refuses an
-   edited repro flow (`fix/<fp>.yaml`) and a flow or check outside the Maestro allow list. `fix-plan.json`'s
-   `verifyNative` lists each native task's flow and the repro flows of the same bug on other native platforms.
-   `native.sh verify-build` (job `verify-native-build`) builds the patched app in a temporary worktree, and
-   `native.sh verify-run` (job `verify-native-run`), from a checkout the patched build never ran in, runs the flow
-   three times on it with no key; a layout or log oracle also
-   needs the probe's ready line in every run. A patched run that fails anywhere, before the bug's assertion too,
-   fails the patch: a fix must leave the whole way to the bug working. Only a failed harness sign-in is run again.
-   Without the patch, a run that never reached the bug, by replay's rules, is run again and never counts as showing
-   it. With `unpatched` (a visual check, or an
-   Android real-AI task, which the keyless run can only check on the fake AI) the flow also runs on the build without
-   the patch and must fail there every time. A native fix PR adds no regression spec. Neither does a fix PR from
-   a c1 session, because the root `playwright.config.ts` does not serve the onboarding build. Neither does a real-AI
-   web fix PR, because that config runs the consumer project on the fake provider. `publish` needs
-   `passed: true` from every platform in `verifyNative` for the fingerprint, web tasks included, and from
-   `verify-real` for a real-AI web task. Only then does it open a draft PR on `qa-fix/<fp>`. Otherwise it writes the
-   diagnosis (for a native platform, "the flow still fails on the native platform") and the ticket gets
-   `Human Required`. A fix from a session whose charter has `postgres` in `legs.ts` (today c7), on any platform,
-   never gets a PR either: the fix job and `verify-native-run` start no Postgres or PowerSync, so they cannot verify
-   it, and its ticket gets `Human Required`.
-   `preview-deploy.yml` deploys no preview for `qa-fix/*` PRs.
+   a task needs that did not succeed (failed, skipped or cancelled) leaves a diagnosis. A fix job that dies before the
+   fix step starts (setup or the stack start failed, so the step's outcome is `skipped`) diagnosed nothing: a step that
+   only a skipped Fix step triggers uploads `qa-fix-infra-<fp>` with `fix/<fp>.infrastructure.md`, `publish` trusts
+   that artifact alone (it deletes a marker that came inside the agent's `qa-fix-<fp>`), touches neither Linear nor
+   GitHub and still succeeds, and the run summary names the ticket and says it was left for a later run. If that
+   upload itself fails, the diagnosis the fix job also writes stands and the ticket gets `Human Required`. The fix job
+   itself shows as failed, so the failure notification fires. A fix step that started and then failed or timed out
+   keeps the diagnosis and `Human Required`. A fix job that uploaded no artifact at all (its key or secret scan
+   failed, or the runner was lost) fails `publish`, because nothing says whether the agent ran.
+   An iOS or Android task carries its Maestro `flow` instead of a spec: the agent writes the patch on Linux (reproducing
+   the bug on the web at phone size in `qa-out/fix-<fp>/repro/web.spec.ts` when it shows there), and a native visual
+   task's check is the Maestro flow `qa-out/fix-<fp>/repro/check.yaml`, which must end on an assertion. Without the
+   patch only that final assertion can show the defect; a step before it that fails makes the run inconclusive.
+   `publish` refuses an edited repro flow (`fix/<fp>.yaml`) and a flow or check outside the Maestro allow list.
+   `fix-plan.json`'s `verifyNative` lists each native task's flow and the repro flows of the same bug on other native
+   platforms. `native.sh verify-build` (job `verify-native-build`) builds the patched app in a temporary worktree, and
+   `native.sh verify-run` (job `verify-native-run`), from a checkout the patched build never ran in, runs the flow three
+   times on it with no key; a layout or log oracle also needs the probe's ready line in every run. A patched run that
+   fails anywhere, before the bug's assertion too, fails the patch: a fix must leave the whole way to the bug working.
+   Only a failed harness sign-in is run again. Without the patch, a run that never reached the bug, by replay's rules,
+   is run again and never counts as showing it. With `unpatched` (a visual check, or an Android real-AI task, which the
+   keyless run can only check on the fake AI) the flow also runs on the build without the patch and must fail there
+   every time. A native fix PR adds no regression spec. Neither does a fix PR from a c1 session, because the root
+   `playwright.config.ts` does not serve the onboarding build. Neither does a real-AI web fix PR, because that config
+   runs the consumer project on the fake provider. `publish` needs `passed: true` from every platform in `verifyNative`
+   for the fingerprint, web tasks included, and from `verify-real` for a real-AI web task. Only then does it open a
+   draft PR on `qa-fix/<fp>`. Otherwise it writes the diagnosis (for a native platform, "the flow still fails on the
+   native platform") and the ticket gets `Human Required`. A fix from a session whose charter has `postgres` in
+   `legs.ts` (today c7), on any platform, never gets a PR either: the fix job and `verify-native-run` start no Postgres
+   or PowerSync, so they cannot verify it, and its ticket gets `Human Required`. `preview-deploy.yml` deploys no preview
+   for `qa-fix/*` PRs.
 7. **report** (`report.ts summary`): the job summary.
 
 Output goes to `qa-out*/` (gitignored). `fixtures/` holds the files the charters upload.
@@ -741,6 +792,34 @@ A test workflow triggered by `push` cannot stand in for this one: `claude-code-a
 This proves every step up to filing. The fix agent and the native verification run only on `main` (the `autofix`
 output checks `github.ref`), so the first run after the merge proves them.
 
+### Fix the tickets of an earlier run
+
+A fix-only run sends the tickets an earlier run filed through fix, verify and publish again, without exploring.
+Use it when that run's fix jobs broke. The run id is the number at the end of the run's URL
+(`/actions/runs/<run id>`):
+
+```sh
+gh workflow run qa-weekly.yml --repo thunderbird/thunderbolt --ref main -f fix_from_run=<run id> -f dry_run=false
+```
+
+- `build` checks the id first. It accepts only digits, only a scheduled or dispatched run of `qa-weekly.yml` on
+  `main` of this repository whose commit is on `main` (a tag named `main` reports the same branch), and only a run
+  whose `qa-filed` artifact has not expired. Artifacts last 7 days. A branch or a fork's pull request runs workflow
+  files of its own, which could upload any artifact without the `qa-agent` environment. It then builds the
+  frontend and both native apps from the current `main`, picks no canaries and plans no explore, replay or judge
+  leg. It ignores `charters`, because every ticket of the earlier run is routed and may need either native app.
+- `file` downloads that run's `qa-replay-*`, `qa-verified-weekly` and `qa-filed`. It uploads the replays again as
+  one `qa-replay-weekly` and the verified findings as `qa-verified-weekly`, so the later jobs read them from this
+  run as usual. It files nothing and routes that run's `filed.json` with the current `fix.ts route`, so routing
+  changes made since then apply. That run's `fix-plan.json` is not used.
+- `fix_from_run` turns autofix on, still only with `QA_AUTOFIX_ENABLED` and on `main`. Without autofix nothing
+  would be routed, so the run fails in `build` before any build. Publishing follows `live` as in every run:
+  `QA_LINEAR_ENABLED`, `main` and `dry_run` off. With the default `dry_run`, publish only logs what it would do.
+- Routing sees each ticket as the earlier run filed it. A ticket closed or canceled since then is still routed, and
+  publish comments on it. A ticket whose `qa-fix/<fp>` branch exists waits, as in every run.
+- The report lists only this run's fix sessions, under a heading that names the earlier run. A failure opens its own
+  incident, `QA weekly fix-only`, so a fix-only run that passes never closes an incident a weekly run opened.
+
 ### Repository variables
 
 The `build` job has no environment, so these must be repository variables.
@@ -784,7 +863,8 @@ Do not add a `LINEAR_API_KEY` to the `qa-agent` environment: it would override t
 Team Thunderbolt needs these labels, or the filer stops and lists the missing ones:
 
 - `qa-agent`, `Bug`, `Security` (filing)
-- `Human Required` (`publish` puts it on a ticket whose fix ended in a diagnosis or a rejected patch)
+- `Human Required` (`publish` puts it on a ticket whose fix ended in a diagnosis or a rejected patch, never one whose
+  fix job died before the agent started)
 - `qa:valid`, `qa:not-a-bug`, `qa:duplicate`, `qa:env-artifact` (triage; the scorecard reads them to compute
   precision, and filing falls back to a dry run while precision stays under 70% over 8+ triaged tickets that are
   not duplicates)
@@ -831,7 +911,7 @@ workspace's spend limit bounds what a leaked key can cost, and auto-fix stays of
 ## Budget calibration
 
 Caps live in one place per step type: the `env` block at the top of `qa-weekly.yml` for explore and fix (budget,
-turns, timeout), `explore.sh` for a native session's turns and its canary's, and the constants at the top of
+turns, timeout), `explore.sh` for a native session's turns, and the constants at the top of
 `verify.ts` for replay and the judge. Explore: $4.01 / 552 turns (299 in a native session) / 63 min. Fix: $20 /
 200 turns / 60 min, its first values, since no fix has run on GitHub yet. Per leg, at most 30 findings are
 replayed (24 on a native leg, whose runs are slow) and 84 judged, and a judge leg spends at most $17, its grouping
@@ -861,7 +941,6 @@ turns, is left out of every peak.
 | explore turns, web               | 18 sessions  | 368 (c4, phone)        | 552                    |
 | explore turns, native            | 14 sessions  | 199 (c4, Android)      | 299                    |
 | explore timeout                  | 32 sessions  | 41.9 min (c4, Android) | 63 min                 |
-| native canary turns              | 15 canaries  | 3                      | 5                      |
 | findings replayed per web leg    | 5 legs       | 20 (real)              | 30                     |
 | findings replayed per native leg | 4 legs       | 25 (android-real)      | 24, the job's limit    |
 | a native run, once warm          | 62 runs      | about 3 min (iOS)      | counted as 4.5 min     |
@@ -902,9 +981,9 @@ numbers the rule gives explore ≈ $1.8 / 341 turns / 11 min and fix ≈ $0.4 / 
 sample per charter.
 
 The native platforms add 15 sessions a week (7 on iOS, without c7; 8 on Android), each with a web session's budget
-and timeout and a Haiku canary before it (5 turns, $0.05). On GitHub an iOS session cost $0.43 to $1.42 and took 59
-to 149 turns and 11 to 39 minutes, an Android one $0.89 to $2.26, 108 to 199 turns and 12 to 42 minutes, and every
-canary took 3 turns. The 15 native sessions cost $14.67 together. The turn cap of a native session is the 299 in
+and timeout. On GitHub an iOS session cost $0.43 to $1.42 and took 59
+to 149 turns and 11 to 39 minutes, an Android one $0.89 to $2.26, 108 to 199 turns and 12 to 42 minutes. The 15
+native sessions cost $14.67 together. The turn cap of a native session is the 299 in
 `explore.sh`, not `QA_EXPLORE_MAX_TURNS`; the budget and the timeout come from the workflow. Runner time grows too: two native builds
 per platform, and every native explore, replay and verify job boots a simulator or an emulator, on macOS runners for
 iOS.
@@ -984,8 +1063,9 @@ Never run on GitHub (only locally, or read in the action's code):
   `replay-native` leg under the `QA_LEG_START` clock;
 - the fix agent's `Edit(**)` rule with its deny list, the two `bun db generate` rules, and the visual check's runs in
   the fix job;
-- the narrow `sudo` stop of the `qa-backend` backend in the real-AI legs. That copy also proved the fix job's dev
-  stack as `qa-dev`: its start, the `ss` port check, the lock and the stop through the same rule.
+- the narrow `sudo` stop of the `qa-backend` backend in the real-AI legs. That copy also proved the `ss` port check, the
+  lock and the stop of the fix job's dev stack as `qa-dev`. Its start failed in the first fix jobs on GitHub because
+  Storybook's cache sat under `node_modules/.cache`, so the `qa` job in `ci.yml` now checks the start as `qa-dev`.
 
 Also:
 
